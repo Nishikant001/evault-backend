@@ -1,0 +1,53 @@
+{
+  "name": "sap2",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "migrate:master": "sequelize-cli db:migrate --config src/config/masterConfig.js --migrations-path src/migrations/master",
+    "migrate:master:undo": "sequelize-cli db:migrate:undo --config src/config/masterConfig.js --migrations-path src/migrations/master",
+    "migrate:master:undo:all": "sequelize-cli db:migrate:undo:all --config src/config/masterConfig.js --migrations-path src/migrations/master",
+    "migrate:master:status": "sequelize-cli db:migrate:status --config src/config/masterConfig.js --migrations-path src/migrations/master",
+    "seed:master:plans": "node scripts/seedMasterPlans.js",
+    "migrate:legacy-to-tenant:dry-run": "node scripts/migrateLegacyToTenant.js --dry-run --all-tenants",
+    "migrate:legacy-to-tenant:tenant": "node scripts/migrateLegacyToTenant.js --tenant",
+    "migrate:legacy-to-tenant:all": "node scripts/migrateLegacyToTenant.js --all-tenants",
+    "migrate:legacy-to-tenant:verify": "node scripts/migrateLegacyToTenant.js --verify --all-tenants"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.16.0",
+    "bcryptjs": "^3.0.3",
+    "canvas": "^3.2.3",
+    "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.1.0",
+    "hpp": "^0.2.3",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.1",
+    "multer": "^2.1.1",
+    "mysql2": "^3.22.5",
+    "node-cron": "^3.0.3",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^3.11.174",
+    "sequelize": "^6.37.8",
+    "socket.io": "^4.8.3",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
+    "tesseract.js": "^7.0.0",
+    "uuid": "^14.0.0"
+  },
+  "devDependencies": {
+    "sequelize-cli": "^6.6.5"
+  },
+  "optionalDependencies": {
+    "pg": "^8.13.0"
+  }
+}
