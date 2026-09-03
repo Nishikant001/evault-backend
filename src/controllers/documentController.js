@@ -721,18 +721,76 @@ const finalizeDocument = async (req, res) => {
   // ── Subscription Management System: FREE tenants never reach SAP ──
   // code. Approval-engine gating above still applies identically to both;
   // only the "where does the binary end up" step differs.
-  if (isFreeTenant(req)) {
-    try {
-      const result = await finalizeDocumentLocally(document, req);
-      return res.json({ success: true, localFilePath: result.localFilePath });
-    } catch (error) {
-      return res.status(500).json({ success: false, message: error.message });
-    }
+ // ── Resolve tenant routing ─────────────────────────────────────
+// There are 3 effective tenant modes:
+//
+// 1. FREE              → existing local flow (UNCHANGED)
+// 2. PAID + ERP        → SAP flow (UNCHANGED)
+// 3. PAID + Non-ERP    → local flow (NEW)
+//
+// tenantType alone cannot determine the destination because both
+// Paid ERP and Paid Non-ERP tenants have tenantType = "PAID".
+
+const tenant = await req.masterModels.Tenant.findByPk(req.user.tenantId, {
+  attributes: ["id", "tenantType", "erpConfigId"],
+});
+
+if (!tenant) {
+  return res.status(404).json({
+    success: false,
+    message: "Tenant not found",
+  });
+}
+
+// ── FREE TENANT ────────────────────────────────────────────────
+// IMPORTANT: Keep the existing FREE behavior exactly as it is.
+if (isFreeTenant(req)) {
+  try {
+    const result = await finalizeDocumentLocally(document, req);
+
+    return res.json({
+      success: true,
+      localFilePath: result.localFilePath,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
   }
+}
 
-  const sapData = await SapFinalizationService.finalizeDocumentToSap(document, req);
+// ── PAID NON-ERP TENANT ────────────────────────────────────────
+// PAID does NOT automatically mean SAP.
+// If no ERP configuration is assigned, finalize locally.
+if (tenant.tenantType === "PAID" && !tenant.erpConfigId) {
+  try {
+    const result = await finalizeDocumentLocally(document, req);
 
-  res.json({ success: true, sapDocumentId: sapData.sapDocumentId, sapPhioId: sapData.sapPhioId });
+    return res.json({
+      success: true,
+      localFilePath: result.localFilePath,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+}
+
+// ── PAID ERP TENANT ────────────────────────────────────────────
+// Existing SAP behavior remains unchanged.
+const sapData = await SapFinalizationService.finalizeDocumentToSap(
+  document,
+  req
+);
+
+res.json({
+  success: true,
+  sapDocumentId: sapData.sapDocumentId,
+  sapPhioId: sapData.sapPhioId,
+});
 };
 
 // ── Activity log ─────────────────────────────────────────────

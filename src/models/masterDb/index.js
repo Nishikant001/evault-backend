@@ -38,6 +38,8 @@ const ErpConfig = require("./ErpConfig");
 const TenantErpConnection = require("./TenantErpConnection");
 const GlobalUserIndex = require("./GlobalUserIndex");
 const SuperAdmin = require("./SuperAdmin");
+const SystemModule = require("./SystemModule");
+const TenantModule = require("./TenantModule");
 
 // ── Tenant ↔ GlobalUserIndex (1:many — PHASE D) ──
 Tenant.hasMany(GlobalUserIndex, { foreignKey: "tenantId" });
@@ -125,6 +127,14 @@ TenantDepartment.belongsTo(Department, { foreignKey: "departmentId" });
 // `Department.getCategories()` or similar will need the two-step lookup
 // pattern in Phase E/H, same as every other master/tenant boundary case.
 
+// ── Tenant ↔ SystemModule (many-to-many through TenantModule) ──
+Tenant.belongsToMany(SystemModule, { through: TenantModule, foreignKey: "tenantId", otherKey: "moduleId", as: "modules" });
+SystemModule.belongsToMany(Tenant, { through: TenantModule, foreignKey: "moduleId", otherKey: "tenantId", as: "tenants" });
+TenantModule.belongsTo(Tenant, { foreignKey: "tenantId" });
+TenantModule.belongsTo(SystemModule, { foreignKey: "moduleId" });
+SystemModule.hasMany(TenantModule, { foreignKey: "moduleId", as: "tenantAssignments" });
+Tenant.hasMany(TenantModule, { foreignKey: "tenantId", as: "moduleAssignments" });
+
 module.exports = {
   masterSequelize,
   Tenant,
@@ -140,4 +150,6 @@ module.exports = {
   TenantErpConnection,
   GlobalUserIndex,
   SuperAdmin,
+  SystemModule,
+  TenantModule,
 };

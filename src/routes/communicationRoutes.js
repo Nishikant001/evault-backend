@@ -8,6 +8,7 @@ const express = require("express");
 const multer = require("multer");
 const router = express.Router();
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const CommunicationController = require("../controllers/communicationController");
 const { VOICE_CONFIG, ATTACHMENT_CONFIG } = require("../constants/communicationConstants");
 
@@ -31,40 +32,42 @@ const attachmentUpload = multer({
 
 // ── Users ────────────────────────────────────────────────────────
 // GET /api/communication/users?q=rahul — tenant-scoped search
-router.get("/users", auth, CommunicationController.searchUsers);
+router.get("/users", auth, requireTenantModule("communication"), CommunicationController.searchUsers);
 
 // ── Conversations ────────────────────────────────────────────────
-router.get("/conversations", auth, CommunicationController.listConversations);
-router.post("/conversations", auth, CommunicationController.createConversation);
-router.post("/conversations/group", auth, CommunicationController.createGroup);
-router.get("/conversations/:id", auth, CommunicationController.getConversation);
-router.patch("/conversations/:id", auth, CommunicationController.renameGroup);
-router.post("/conversations/:id/participants", auth, CommunicationController.addParticipants);
-router.delete("/conversations/:id/participants/:userId", auth, CommunicationController.removeParticipant);
+router.get("/conversations", auth, requireTenantModule("communication"), CommunicationController.listConversations);
+router.post("/conversations", auth, requireTenantModule("communication"), CommunicationController.createConversation);
+router.post("/conversations/group", auth, requireTenantModule("communication"), CommunicationController.createGroup);
+router.get("/conversations/:id", auth, requireTenantModule("communication"), CommunicationController.getConversation);
+router.patch("/conversations/:id", auth, requireTenantModule("communication"), CommunicationController.renameGroup);
+router.post("/conversations/:id/participants", auth, requireTenantModule("communication"), CommunicationController.addParticipants);
+router.delete("/conversations/:id/participants/:userId", auth, requireTenantModule("communication"), CommunicationController.removeParticipant);
 
 // ── Messages ─────────────────────────────────────────────────────
-router.get("/conversations/:id/messages", auth, CommunicationController.listMessages);
-router.post("/conversations/:id/messages", auth, CommunicationController.sendMessage);
-router.post("/conversations/:id/read", auth, CommunicationController.markRead);
-router.patch("/messages/:id", auth, CommunicationController.editMessage);
-router.delete("/messages/:id", auth, CommunicationController.deleteMessage);
+router.get("/conversations/:id/messages", auth, requireTenantModule("communication"), CommunicationController.listMessages);
+router.post("/conversations/:id/messages", auth, requireTenantModule("communication"), CommunicationController.sendMessage);
+router.post("/conversations/:id/read", auth, requireTenantModule("communication"), CommunicationController.markRead);
+router.patch("/messages/:id", auth, requireTenantModule("communication"), CommunicationController.editMessage);
+router.delete("/messages/:id", auth, requireTenantModule("communication"), CommunicationController.deleteMessage);
 
 // ── Voice ────────────────────────────────────────────────────────
 router.post(
   "/conversations/:id/voice",
   auth,
+  requireTenantModule("communication"),
   voiceUpload.single("voice"),
   CommunicationController.sendVoiceMessage
 );
-router.get("/voice/:id", auth, CommunicationController.streamVoice);
+router.get("/voice/:id", auth, requireTenantModule("communication"), CommunicationController.streamVoice);
 
 // ── Attachments ──────────────────────────────────────────────────
 router.post(
   "/conversations/:id/attachments",
   auth,
+  requireTenantModule("communication"),
   attachmentUpload.array("files", ATTACHMENT_CONFIG.maxFilesPerMessage),
   CommunicationController.sendAttachmentMessage
 );
-router.get("/attachments/:id/download", auth, CommunicationController.downloadAttachment);
+router.get("/attachments/:id/download", auth, requireTenantModule("communication"), CommunicationController.downloadAttachment);
 
 module.exports = router;

@@ -3,6 +3,7 @@ const express = require("express");
 const multer = require("multer");
 const router = express.Router();
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const role = require("../middleware/roleMiddleware");
 const {
   loadSubscription,
@@ -50,7 +51,7 @@ const upload = multer({
 // state, so a FREE tenant whose trial has expired can still view/download
 // what they already uploaded, but cannot upload/finalize/delete further
 // until they upgrade.
-router.use(auth, loadSubscription);
+router.use(auth, requireTenantModule("dms"), loadSubscription);
 
 router.post(
   "/upload",

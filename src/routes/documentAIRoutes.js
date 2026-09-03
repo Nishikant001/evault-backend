@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const role = require("../middleware/roleMiddleware");
 const { loadSubscription, requireAI } = require("../middleware/subscriptionMiddleware"); // NEW (Subscription Management System)
 const {
@@ -26,7 +27,7 @@ const WRITE_ROLES = ["SuperAdmin", "TenantAdmin", "BranchManager", "DeptHead", "
 
 // Every route here is an AI Document Assistant feature -> gate the whole
 // router behind requireAI once. FREE tenants never reach a provider call.
-router.use(auth, loadSubscription, requireAI);
+router.use(auth, requireTenantModule("ai_assistant"), loadSubscription, requireAI);
 
 // ── Single/paired document AI features ────────────────────────
 router.get("/documents/:id/summarize", role(...READ_ROLES), summarize);

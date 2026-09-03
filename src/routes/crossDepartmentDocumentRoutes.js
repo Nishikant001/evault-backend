@@ -5,6 +5,7 @@ const express = require("express");
 const router = express.Router();
 
 const authMiddleware = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 
 const {
   createRequest,
@@ -25,7 +26,7 @@ const {
 // AUTHENTICATION
 // ============================================================
 
-router.use(authMiddleware);
+router.use(authMiddleware, requireTenantModule("cross_department"));
 
 
 // ============================================================

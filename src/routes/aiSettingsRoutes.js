@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const role = require("../middleware/roleMiddleware");
 const { loadSubscription, requireAI } = require("../middleware/subscriptionMiddleware"); // NEW (Subscription Management System)
 const {
@@ -17,7 +18,7 @@ const READ_ROLES = ["SuperAdmin", "TenantAdmin", "BranchManager", "DeptHead", "M
 
 // AI provider/settings configuration is itself an AI Assistant capability
 // -> gated the same as the rest of the AI module.
-router.use(auth, loadSubscription, requireAI);
+router.use(auth, requireTenantModule("ai_assistant"), loadSubscription, requireAI);
 
 // ── Providers ──────────────────────────────────────────────────
 // POST   /api/ai/providers        → add a provider (OpenAI/Anthropic/Gemini/Azure/Ollama)

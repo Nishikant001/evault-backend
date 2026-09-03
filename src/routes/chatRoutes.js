@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const role = require("../middleware/roleMiddleware");
 const { loadSubscription, requireFeature } = require("../middleware/subscriptionMiddleware"); // NEW (Subscription Management System)
 const { FEATURE_KEYS } = require("../constants/subscriptionConstants");
@@ -18,7 +19,7 @@ const ALL_ROLES = ["SuperAdmin", "TenantAdmin", "BranchManager", "DeptHead", "Ma
 
 // RAG chat is gated on the more specific AI_CHAT flag (a plan could in
 // theory enable AI_ASSISTANT features without chat, or vice versa).
-router.use(auth, loadSubscription, requireFeature(FEATURE_KEYS.AI_CHAT));
+router.use(auth, requireTenantModule("ai_assistant"), loadSubscription, requireFeature(FEATURE_KEYS.AI_CHAT));
 
 // POST   /api/ai/chat/sessions               → start a session (scopeType=ALL|DOCUMENT|DOCUMENT_SET|FOLDER)
 // GET    /api/ai/chat/sessions                → list my sessions

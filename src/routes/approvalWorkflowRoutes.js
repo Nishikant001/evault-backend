@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const role = require("../middleware/roleMiddleware");
 const ApprovalWorkflowController = require("../controllers/approvalWorkflowController");
 
@@ -11,12 +12,12 @@ const BUILDER_ROLES = ["SuperAdmin", "TenantAdmin"];
 // (e.g. so an approver can see why they're in a chain).
 const VIEWER_ROLES = [...BUILDER_ROLES, "BranchManager", "DeptHead", "Manager", "Approver"];
 
-router.post("/", auth, role(...BUILDER_ROLES), ApprovalWorkflowController.create);
-router.get("/", auth, role(...VIEWER_ROLES), ApprovalWorkflowController.list);
-router.get("/by-combo", auth, role(...VIEWER_ROLES), ApprovalWorkflowController.getByCombo);
-router.get("/:id", auth, role(...VIEWER_ROLES), ApprovalWorkflowController.getById);
-router.put("/:id", auth, role(...BUILDER_ROLES), ApprovalWorkflowController.update);
-router.delete("/:id", auth, role(...BUILDER_ROLES), ApprovalWorkflowController.remove);
-router.post("/levels/:levelId/assignments", auth, role(...BUILDER_ROLES), ApprovalWorkflowController.assignApprovers);
+router.post("/", auth, requireTenantModule("approval_engine"), role(...BUILDER_ROLES), ApprovalWorkflowController.create);
+router.get("/", auth, requireTenantModule("approval_engine"), role(...VIEWER_ROLES), ApprovalWorkflowController.list);
+router.get("/by-combo", auth, requireTenantModule("approval_engine"), role(...VIEWER_ROLES), ApprovalWorkflowController.getByCombo);
+router.get("/:id", auth, requireTenantModule("approval_engine"), role(...VIEWER_ROLES), ApprovalWorkflowController.getById);
+router.put("/:id", auth, requireTenantModule("approval_engine"), role(...BUILDER_ROLES), ApprovalWorkflowController.update);
+router.delete("/:id", auth, requireTenantModule("approval_engine"), role(...BUILDER_ROLES), ApprovalWorkflowController.remove);
+router.post("/levels/:levelId/assignments", auth, requireTenantModule("approval_engine"), role(...BUILDER_ROLES), ApprovalWorkflowController.assignApprovers);
 
 module.exports = router;

@@ -54,7 +54,8 @@ const aiSettingsRoutes      = require("./routes/aiSettingsRoutes");       // NEW
 const chatRoutes            = require("./routes/chatRoutes");            // NEW (AI Document Assistant — RAG chat)
 const documentAIRoutes      = require("./routes/documentAIRoutes");      // NEW (AI Document Assistant — summarize/compare/classify/search)
 const subscriptionRoutes    = require("./routes/subscriptionRoutes");    // NEW (Subscription Management System — FREE registration/login + plan admin)
-const planRoutes            = require("./routes/planRoutes");            // NEW (Subscription Management System — plan/feature catalog admin)
+const planRoutes            = require("./routes/planRoutes");
+const tenantModuleRoutes    = require("./routes/tenantModuleRoutes");            // NEW (Subscription Management System — plan/feature catalog admin)
 const notificationRoutes    = require("./routes/notificationRoutes");    // NEW (Subscription Management System — in-app dashboard notifications)
 const subscriptionScheduler = require("./services/subscriptionScheduler"); // NEW (daily trial expiry + reminder notifications)
 const tenantStorageScheduler = require("./services/tenantStorageScheduler"); // hourly tenant DB/file storage metering
@@ -181,6 +182,7 @@ app.use("/api/ai",                 documentAIRoutes);
 // Subscription Management System (FREE registration/login, SuperAdmin plan admin)
 app.use("/api/subscriptions",      subscriptionRoutes);
 app.use("/api/plans",              planRoutes);
+app.use("/api/modules",            tenantModuleRoutes);
 app.use("/api/notifications",      notificationRoutes);
 
 // ── Internal Communication Module (1-to-1 chat + voice messages) ───────

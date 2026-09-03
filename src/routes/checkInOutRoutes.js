@@ -8,6 +8,7 @@ const express = require("express");
 const multer = require("multer");
 const router = express.Router();
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const role = require("../middleware/roleMiddleware");
 const {
   checkOut,
@@ -47,6 +48,7 @@ const VIEW_ROLES = [
 router.post(
   "/:id/checkout",
   auth,
+  requireTenantModule("dms"),
   role(...CheckInOutService.CHECKOUT_ROLES),
   checkOut
 );
@@ -54,6 +56,7 @@ router.post(
 router.post(
   "/:id/checkin",
   auth,
+  requireTenantModule("dms"),
   role(...CheckInOutService.CHECKOUT_ROLES),
   upload.single("file"),
   checkIn
@@ -62,12 +65,13 @@ router.post(
 router.post(
   "/:id/force-unlock",
   auth,
+  requireTenantModule("dms"),
   role(...CheckInOutService.FORCE_UNLOCK_ROLES),
   forceUnlock
 );
 
-router.get("/:id/lock-status", auth, role(...VIEW_ROLES), getLockStatus);
+router.get("/:id/lock-status", auth, requireTenantModule("dms"), role(...VIEW_ROLES), getLockStatus);
 
-router.get("/:id/version-history", auth, role(...VIEW_ROLES), getVersionHistory);
+router.get("/:id/version-history", auth, requireTenantModule("dms"), role(...VIEW_ROLES), getVersionHistory);
 
 module.exports = router;

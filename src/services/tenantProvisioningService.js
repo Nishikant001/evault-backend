@@ -171,6 +171,7 @@ async function provisionTenant(masterModels, tenantId, adminUser) {
 
 async function doProvisionTenant(masterModels, tenantId, adminUser) {
   const { TenantDatabase, GlobalUserIndex } = masterModels;
+  const { ensureDefaultTenantModules } = require("./tenantModuleService");
 
   let tenantDb = await TenantDatabase.findOne({ where: { tenantId } });
   if (!tenantDb) {
@@ -242,6 +243,9 @@ async function doProvisionTenant(masterModels, tenantId, adminUser) {
       });
       createdIndexRow = true;
     }
+
+    step = "ENSURE_DEFAULT_MODULES";
+    await ensureDefaultTenantModules(tenantId, null);
 
     step = "HEALTH_CHECK";
     await tenantSequelize.query("SELECT 1");

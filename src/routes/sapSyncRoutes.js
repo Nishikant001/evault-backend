@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 
 const auth = require("../middleware/authMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 const role = require("../middleware/roleMiddleware");
 const { loadSubscription, requireSAP } = require("../middleware/subscriptionMiddleware"); // NEW (Subscription Management System)
 const { SYNC_EXECUTE_ROLES, SYNC_VIEW_ROLES } = require("../constants/sapSyncConstants");
@@ -36,7 +37,7 @@ const {
 // Every route in this file talks to SAP -> gate the whole router behind
 // auth + requireSAP once, instead of repeating it on every line. FREE
 // tenants never reach any controller below this.
-router.use(auth, loadSubscription, requireSAP);
+router.use(auth, requireTenantModule("sap_sync"), loadSubscription, requireSAP);
 
 // POST   /api/sap-sync/masters      → run SAP Master Synchronization (Department -> Category -> DocumentType)
 // POST   /api/sap-sync/documents    → run SAP Document Synchronization (DocumentMetaSet, HasOriginal = 'X' only)

@@ -9,6 +9,7 @@ require("../middleware/authMiddleware");
 
 const roleMiddleware =
 require("../middleware/roleMiddleware");
+const { requireTenantModule } = require("../middleware/tenantModuleMiddleware");
 
 const AuditController =
 require("../controllers/auditController");
@@ -77,6 +78,7 @@ const AUDIT_VIEWER_ROLES = ["SuperAdmin", "TenantAdmin", "Auditor"];
 router.get(
   "/",
   authMiddleware,
+  requireTenantModule("audit"),
   roleMiddleware(...AUDIT_VIEWER_ROLES),
   AuditController.getAll
 );
@@ -94,6 +96,7 @@ router.get(
 router.get(
   "/export",
   authMiddleware,
+  requireTenantModule("audit"),
   roleMiddleware(...AUDIT_VIEWER_ROLES),
   AuditController.exportCsv
 );
@@ -111,6 +114,7 @@ router.get(
 router.get(
   "/meta/filters",
   authMiddleware,
+  requireTenantModule("audit"),
   roleMiddleware(...AUDIT_VIEWER_ROLES),
   AuditController.getFilterMeta
 );
@@ -135,6 +139,7 @@ router.get(
 router.get(
   "/:id",
   authMiddleware,
+  requireTenantModule("audit"),
   roleMiddleware(...AUDIT_VIEWER_ROLES),
   AuditController.getById
 );
