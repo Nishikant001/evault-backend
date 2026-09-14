@@ -1,0 +1,27 @@
+HTTP/1.1 401 Unauthorized
+Vary: Origin, Accept-Encoding
+Access-Control-Allow-Credentials: true
+Content-Security-Policy: default-src 'self';base-uri 'self';font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';img-src 'self' data:;object-src 'none';script-src 'self';script-src-attr 'none';style-src 'self' https: 'unsafe-inline';upgrade-insecure-requests
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+Origin-Agent-Cluster: ?1
+Referrer-Policy: no-referrer
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-DNS-Prefetch-Control: off
+X-Download-Options: noopen
+X-Frame-Options: SAMEORIGIN
+X-Permitted-Cross-Domain-Policies: none
+X-XSS-Protection: 0
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 99
+Date: Thu, 27 Aug 2026 08:02:43 GMT
+X-RateLimit-Reset: 1787818664
+X-Request-Id: 291864b9-df1a-47f6-9492-d4ca27198b28
+Content-Type: application/json; charset=utf-8
+Content-Length: 57
+ETag: W/"39-ijgPVPOHjk3+hs05lqYs5XIlOoc"
+Connection: keep-alive
+Keep-Alive: timeout=5
+
+{"success":false,"message":"Invalid SAP API credentials"}

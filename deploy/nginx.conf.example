@@ -1,0 +1,143 @@
+# deploy/nginx.conf.example
+#
+# PRODUCTION DEPLOYMENT — Nginx reverse proxy for the Procur backend.
+#
+# MANUAL STEP: copy this file to /etc/nginx/sites-available/procur.conf,
+# replace every YOUR_DOMAIN placeholder, symlink it into
+# /etc/nginx/sites-enabled/, then `nginx -t && systemctl reload nginx`.
+# This repo does not and cannot apply this file for you — it lives
+# outside the application/Git deployment and touches system-level Nginx
+# config (brief "Do not assume DNS provider" / "manual steps").
+#
+# Placeholders to replace:
+#   YOUR_DOMAIN        e.g. mydms.com   (apex domain)
+#   YOUR_PORT           the PORT the Node app listens on (.env PORT, default 3000)
+# Nothing here hard-codes a server IP — Nginx binds to the machine it
+# runs on and proxies to 127.0.0.1, which is correct regardless of what
+# the server's public IP is (brief "Do not hard-code server IP").
+
+# ── Rate limiting zone (defense in depth alongside the app's own
+#    express-rate-limit — this one protects Nginx/the OS itself from
+#    being overwhelmed before a request ever reaches Node) ───────────
+limit_req_zone $binary_remote_addr zone=procur_general:10m rate=20r/s;
+
+# ── HTTP -> HTTPS redirect, for BOTH the apex/API host and every
+#    tenant subdomain ──────────────────────────────────────────────
+server {
+    listen 80;
+    listen [::]:80;
+    server_name YOUR_DOMAIN app.YOUR_DOMAIN *.app.YOUR_DOMAIN;
+
+    # Required for ACME HTTP-01 challenges if you use that validation
+    # method instead of DNS-01 (see DEPLOYMENT.md "SSL" — DNS-01 is
+    # required for the wildcard cert itself, but HTTP-01 may still be
+    # used for the apex/API host's own certificate).
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── Tenant application: *.app.YOUR_DOMAIN (wildcard) ───────────────
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name *.app.YOUR_DOMAIN;
+
+    # MANUAL STEP: certificate paths. See DEPLOYMENT.md "SSL" for how
+    # this wildcard cert is obtained (DNS-01 validation) and renewed.
+    # NEVER commit these files to Git (see .gitignore).
+    ssl_certificate     /etc/letsencrypt/live/app.YOUR_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.YOUR_DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # HSTS — only enable once you are certain every subdomain will
+    # always be served over HTTPS (this header is sticky in browsers).
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+
+    # File upload ceiling. The app's own multer config caps document
+    # uploads at 50 MB (src/routes/documentRoutes.js) — this must be >=
+    # that, with headroom for multipart overhead.
+    client_max_body_size 60M;
+
+    # Timeouts — generous enough for large uploads / slow tenant DB
+    # queries without hanging connections indefinitely.
+    proxy_connect_timeout 10s;
+    proxy_send_timeout    120s;
+    proxy_read_timeout    120s;
+    send_timeout          120s;
+
+    limit_req zone=procur_general burst=40 nodelay;
+
+    location / {
+        proxy_pass http://127.0.0.1:YOUR_PORT;
+
+        # Preserve the ORIGINAL request identity for the Node app.
+        # hostContextMiddleware.js resolves the tenant from req.hostname,
+        # which Express derives from the Host header once
+        # TRUST_PROXY_HOPS=1 is set (see .env.example) — so Host must be
+        # forwarded UNCHANGED, not rewritten to the upstream address.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+
+# ── Bare application/API host: YOUR_DOMAIN and app.YOUR_DOMAIN itself
+#    (no subdomain) — registration, SuperAdmin, health checks, Swagger.
+#    Kept as a SEPARATE server block (not folded into the wildcard
+#    block above) so it can have its own certificate if desired, and so
+#    a typo in server_name precedence never accidentally routes tenant
+#    traffic here or vice versa. ──────────────────────────────────────
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name YOUR_DOMAIN app.YOUR_DOMAIN;
+
+    ssl_certificate     /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+
+    client_max_body_size 60M;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout    120s;
+    proxy_read_timeout    120s;
+    send_timeout          120s;
+
+    limit_req zone=procur_general burst=40 nodelay;
+
+    location / {
+        proxy_pass http://127.0.0.1:YOUR_PORT;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+
+    # Nginx-level health probe target (LB/orchestrator can hit this over
+    # plain HTTPS without going through app-level rate limiting concerns).
+    location = /health {
+        proxy_pass http://127.0.0.1:YOUR_PORT/health;
+        proxy_set_header Host $host;
+        access_log off;
+    }
+}
