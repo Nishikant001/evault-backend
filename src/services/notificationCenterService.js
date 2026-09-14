@@ -8,13 +8,46 @@
 //
 // Phase 5: Notification is a per-tenant model — every method now takes
 // `models` as its first parameter.
+const { SOCKET_EVENTS } = require("../constants/communicationConstants");
 
 class NotificationCenterService {
   /** userId omitted/null = tenant-wide, shown to every user of that tenant. */
-  static async create(models, { tenantId, userId = null, type = "SYSTEM", title, message }) {
-    const { Notification } = models;
-    return Notification.create({ tenantId, userId, type, title, message });
+  static async create(
+  models,
+  { tenantId, userId = null, type = "SYSTEM", title, message, metadata = null }
+) {
+  const { Notification } = models;
+
+  const notification = await Notification.create({
+    tenantId,
+    userId,
+    type,
+    title,
+    message,
+    metadata,
+  });
+
+  // Realtime notification is best-effort.
+  // Database remains the source of truth.
+  try {
+    const CommunicationSocket = require("./communicationSocketService");
+
+    if (userId) {
+      CommunicationSocket.emitToUser(
+  userId,
+  SOCKET_EVENTS.NOTIFICATION_NEW,
+  notification.toJSON()
+);
+    }
+  } catch (error) {
+    console.log(
+      "Realtime notification error:",
+      error.message
+    );
   }
+
+  return notification;
+}
 
   /** Returns notifications visible to this user: tenant-wide (userId=null) + their own. */
   static async listForUser(models, tenantId, userId, { unreadOnly = false, limit = 50 } = {}) {
@@ -48,6 +81,18 @@ class NotificationCenterService {
       { where: { tenantId, userId: { [Op.or]: [null, userId] } } },
     );
   }
+  static async unreadCount(models, tenantId, userId) {
+  const { Notification } = models;
+  const { Op } = require("sequelize");
+
+  return Notification.count({
+    where: {
+      tenantId,
+      userId: { [Op.or]: [null, userId] },
+      isRead: false,
+    },
+  });
+}
 }
 
 module.exports = NotificationCenterService;

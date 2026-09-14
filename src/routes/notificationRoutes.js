@@ -9,7 +9,23 @@ const NotificationController = require("../controllers/notificationController");
 // PUT  /api/notifications/:id/read     → mark one read
 // PUT  /api/notifications/read-all     → mark all read
 router.get("/", auth, NotificationController.list);
-router.put("/read-all", auth, NotificationController.markAllRead);
-router.put("/:id/read", auth, NotificationController.markRead);
+
+router.get(
+  "/unread-count",
+  auth,
+  NotificationController.unreadCount
+);
+
+router.put(
+  "/read-all",
+  auth,
+  NotificationController.markAllRead
+);
+
+router.put(
+  "/:id/read",
+  auth,
+  NotificationController.markRead
+);
 
 module.exports = router;

@@ -89,7 +89,7 @@ app.use(helmet());
 app.use(compression());
 app.use(cookieParser());
 app.use(hpp());
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+app.use(rateLimit({ windowMs: 15 * 60 * 19000, max: 19000 }));
 app.use(express.json());
 app.use(morgan("dev"));
 

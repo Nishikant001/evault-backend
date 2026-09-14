@@ -144,6 +144,8 @@ const SOCKET_EVENTS = {
   MESSAGE_STOP_TYPING: "communication:message:stop-typing",
   MESSAGE_EDITED: "communication:message:edited",
   MESSAGE_DELETED: "communication:message:deleted",
+  // Notifications
+NOTIFICATION_NEW: "notification:new",
 
   // Conversation
   CONVERSATION_CREATED: "communication:conversation:created",

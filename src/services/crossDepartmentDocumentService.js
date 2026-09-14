@@ -500,10 +500,11 @@ async function searchSourceDocuments(
     status: "ACTIVE",
   };
 
-  if (payload.query) {
+    if (payload.query) {
     where[Op.or] = [
       { originalFileName: { [Op.like]: `%${payload.query}%` } },
       { sapDocumentId: { [Op.like]: `%${payload.query}%` } },
+      { tcode: { [Op.like]: `%${payload.query}%` } },
     ];
   }
 
@@ -872,7 +873,12 @@ async function prepareShare(
     document.originalFileName
   );
 
-  fs.writeFileSync(tempPath, sourceBuffer);
+   fs.writeFileSync(tempPath, sourceBuffer);
+
+  // Pristine backup — maskShare() always masks from THIS, never from
+  // temporaryStorageKey, so repeated mask attempts (Back to Edit, retry,
+  // etc.) never stack old masks underneath new ones.
+  fs.writeFileSync(`${tempPath}.orig`, sourceBuffer);
 
   share.temporaryStorageKey = tempPath;
   share.temporaryFileName = document.originalFileName;
@@ -1172,6 +1178,54 @@ async function viewShare(
 }
 
 
+
+// ============================================================
+// OWNER PREVIEW (masked copy, before sending)
+//
+// viewShare() above is RECIPIENT-only (assertRecipient requires
+// share.recipientUserId === the calling user). The owner previewing
+// their own masked copy — via PreviewMaskedCopy.jsx, before the share
+// has even been sent — is never the recipient, so that check must not
+// apply here. This reuses the same department-based authorization
+// maskShare() already uses for the owner side.
+// ============================================================
+
+async function ownerPreviewShare(req, shareId) {
+  const { CrossDepartmentDocumentShare } = getModels(req);
+  const tenantId = getTenantId(req);
+
+  const share = await CrossDepartmentDocumentShare.findOne({
+    where: { id: shareId, tenantId },
+  });
+
+  if (!share) {
+    const error = new Error("Temporary document share not found");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  // Same owner/department authorization maskShare() uses — NOT the
+  // recipient check.
+  await assertShareDepartmentAccess(req, share);
+
+  if (!share.temporaryStorageKey || !fs.existsSync(share.temporaryStorageKey)) {
+    const error = new Error("Temporary shared document not found");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const buffer = fs.readFileSync(share.temporaryStorageKey);
+
+  return {
+    buffer,
+    mimeType: share.temporaryMimeType,
+    fileName: share.temporaryFileName,
+  };
+}
+
+
+
+
 // ============================================================
 // DOWNLOAD
 // ============================================================
@@ -1399,7 +1453,14 @@ async function maskShare(
     return { page, type: "rect", x, y, width, height };
   });
 
-  const fileBuffer = fs.readFileSync(share.temporaryStorageKey);
+    // Always mask from the pristine original, never from a previously
+  // masked file — otherwise repeated mask attempts stack old strokes
+  // underneath new ones. Older shares created before this fix have no
+  // ".orig" backup, so fall back to the current file for those.
+  const originalPath = `${share.temporaryStorageKey}.orig`;
+  const fileBuffer = fs.existsSync(originalPath)
+    ? fs.readFileSync(originalPath)
+    : fs.readFileSync(share.temporaryStorageKey);
 
   if (share.temporaryMimeType === "application/pdf") {
     const { PDFDocument, rgb } = require("pdf-lib");
@@ -1682,6 +1743,11 @@ async function cleanupShareFile(
         share.temporaryStorageKey
       );
     }
+
+    const originalPath = `${share.temporaryStorageKey}.orig`;
+    if (fs.existsSync(originalPath)) {
+      await fs.promises.unlink(originalPath);
+    }
   } catch (error) {
     // Cleanup must not crash the request lifecycle.
     console.error(
@@ -1707,6 +1773,7 @@ module.exports = {
   sendShare,
   getAccessibleShare,
   viewShare,
+  ownerPreviewShare,
   downloadShare,
   maskShare,
   revokeShare,

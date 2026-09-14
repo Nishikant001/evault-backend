@@ -17,6 +17,7 @@ const {
   maskShare,
   sendShare,
   viewShare,
+  ownerPreviewShare,
   downloadShare,
   revokeShare,
   rejectRequest,
@@ -191,6 +192,25 @@ router.post(
 router.get(
   "/cross-department-shares/:id/view",
   viewShare
+);
+
+
+// ============================================================
+// OWNER — PREVIEW MASKED COPY (before sending)
+// ============================================================
+
+// GET
+// /api/cross-department-documents/
+// cross-department-shares/:id/owner-preview
+//
+// IMPORTANT:
+// For the OWNER previewing their own masked work before sending —
+// authorized by department access (like /mask), NOT by
+// share.recipientUserId. Never use /view for this — /view is
+// recipient-only and will 403 for the owner.
+router.get(
+  "/cross-department-shares/:id/owner-preview",
+  ownerPreviewShare
 );
 
 

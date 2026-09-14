@@ -35,6 +35,26 @@ class NotificationController {
       return res.status(500).json({ success: false, message: error.message });
     }
   }
+  static async unreadCount(req, res) {
+  try {
+    const count = await NotificationCenterService.unreadCount(
+      req.models,
+      req.user.tenantId,
+      req.user.id
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: { count },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
 }
+}
+
 
 module.exports = NotificationController;

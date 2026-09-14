@@ -49,7 +49,11 @@ const ApprovalController = {
       });
       return res.json({
         success: true,
-        message: result.isFinalLevel ? "Final approval granted — document sent to SAP" : "Approved, moved to next level",
+                message: result.isFinalLevel
+          ? result.sapResult?.usedSap
+            ? "Final approval granted — document sent to SAP"
+            : "Final approval granted — document finalized"
+          : "Approved, moved to next level",
         data: result.documentApproval,
         sap: result.sapResult,
       });

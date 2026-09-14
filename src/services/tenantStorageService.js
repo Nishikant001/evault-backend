@@ -88,7 +88,9 @@ async function measureFileBytes(tenantId) {
 }
 
 function quotaFor(tenantDb, field, fallback) {
-  const configured = Number(tenantDb?.[field]);
+  const raw = tenantDb?.[field];
+  if (raw === null || raw === undefined || raw === "") return fallback;
+  const configured = Number(raw);
   return Number.isFinite(configured) && configured >= 0 ? configured : fallback;
 }
 

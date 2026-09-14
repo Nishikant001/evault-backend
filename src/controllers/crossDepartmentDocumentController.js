@@ -591,6 +591,56 @@ const sendShare = async (req, res) => {
 // Never call the normal document view endpoint.
 // ─────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────
+// OWNER — PREVIEW MASKED COPY (before sending)
+//
+// GET /api/cross-department-shares/:id/owner-preview
+//
+// Same file as viewShare, but authorized for the OWNER (department
+// access, like maskShare) instead of the recipient — the owner is
+// previewing their own work before it's ever sent, so they are never
+// share.recipientUserId.
+// ─────────────────────────────────────────────────────────────
+
+const ownerPreviewShare = async (req, res) => {
+  try {
+    const shareId = Number(req.params.id);
+
+    if (!Number.isInteger(shareId) || shareId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid share id",
+      });
+    }
+
+    const file =
+      await crossDepartmentDocumentService.ownerPreviewShare(req, shareId);
+
+    if (!file || !file.buffer) {
+      return res.status(404).json({
+        success: false,
+        message: "Temporary shared document not found",
+      });
+    }
+
+    if (file.mimeType) {
+      res.setHeader("Content-Type", file.mimeType);
+    }
+
+    if (file.fileName) {
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${String(file.fileName).replace(/"/g, "")}"`
+      );
+    }
+
+    return res.send(file.buffer);
+  } catch (error) {
+    return sendError(res, error);
+  }
+};
+
+
 const viewShare = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -782,6 +832,7 @@ module.exports = {
   maskShare,
   sendShare,
   viewShare,
+  ownerPreviewShare,
   downloadShare,
   revokeShare,
   rejectRequest,

@@ -20,7 +20,12 @@
 const AuditService = require("./auditService");
 const NotificationHookService = require("./notificationHookService");
 const { finalizeDocumentToSap } = require("./sapFinalizationService");
-const { AUDIT_ACTIONS, AUDIT_MODULES, AUDIT_STATUS } = require("../constants/auditActions");
+const { finalizeDocumentLocally } = require("./localFinalizationService");
+const {
+  AUDIT_ACTIONS,
+  AUDIT_MODULES,
+  AUDIT_STATUS,
+} = require("../constants/auditActions");
 const {
   DOCUMENT_APPROVAL_STATUS: STATUS,
   APPROVAL_ACTIONS: ACTION,
@@ -33,6 +38,29 @@ const IN_PROGRESS_STATUSES = [
   STATUS.PARTIALLY_APPROVED,
 ];
 
+// Mirrors documentController.finalizeDocument's tenant routing — the
+// approval engine must NOT assume every tenant has SAP/ERP configured.
+// There are 3 effective tenant modes:
+//   1. FREE            → local storage (never touches SAP)
+//   2. PAID + ERP       → SAP flow (existing behavior, unchanged)
+//   3. PAID + Non-ERP   → local storage (same as FREE — no ERP config to push to)
+async function finalizeApprovedDocument(document, req) {
+  const tenant = await req.masterModels.Tenant.findByPk(req.user.tenantId, {
+    attributes: ["id", "tenantType", "erpConfigId"],
+  });
+
+  const isFreeTenant = tenant && String(tenant.tenantType).toUpperCase() === "FREE";
+  const isPaidNonErp = tenant && tenant.tenantType === "PAID" && !tenant.erpConfigId;
+
+  if (isFreeTenant || isPaidNonErp) {
+    const result = await finalizeDocumentLocally(document, req);
+    return { ...result, usedSap: false };
+  }
+
+  const result = await finalizeDocumentToSap(document, req);
+  return { ...result, usedSap: true };
+}
+
 function workflowInclude(models) {
   return [
     {
@@ -40,7 +68,14 @@ function workflowInclude(models) {
       as: "levels",
       where: { status: "ACTIVE" },
       required: false,
-      include: [{ model: models.ApprovalAssignment, as: "assignments", where: { status: "ACTIVE" }, required: false }],
+      include: [
+        {
+          model: models.ApprovalAssignment,
+          as: "assignments",
+          where: { status: "ACTIVE" },
+          required: false,
+        },
+      ],
     },
   ];
 }
@@ -67,7 +102,10 @@ class ApprovalEngineService {
   }
 
   static async isApprovalRequired(models, document) {
-    const workflow = await ApprovalEngineService.getWorkflowForDocument(models, document);
+    const workflow = await ApprovalEngineService.getWorkflowForDocument(
+      models,
+      document,
+    );
     return !!(workflow && workflow.levels && workflow.levels.length > 0);
   }
 
@@ -80,14 +118,21 @@ class ApprovalEngineService {
     const models = req.models;
     const { DocumentApproval, ApprovalHistory } = models;
 
-    const workflow = await ApprovalEngineService.getWorkflowForDocument(models, document);
-    const levels = (workflow?.levels || []).slice().sort((a, b) => a.levelNumber - b.levelNumber);
+    const workflow = await ApprovalEngineService.getWorkflowForDocument(
+      models,
+      document,
+    );
+    const levels = (workflow?.levels || [])
+      .slice()
+      .sort((a, b) => a.levelNumber - b.levelNumber);
 
     if (!workflow || levels.length === 0) {
       return { required: false, documentApproval: null };
     }
 
-    const existing = await DocumentApproval.findOne({ where: { documentId: document.id } });
+    const existing = await DocumentApproval.findOne({
+      where: { documentId: document.id },
+    });
     if (existing) {
       // Already has an approval run (e.g. re-submission handled via resubmit()).
       return { required: true, documentApproval: existing };
@@ -105,7 +150,7 @@ class ApprovalEngineService {
           submittedBy: user.id,
           submittedAt: new Date(),
         },
-        { transaction: t }
+        { transaction: t },
       );
 
       await ApprovalHistory.create(
@@ -122,7 +167,7 @@ class ApprovalEngineService {
           comments: "Document submitted for approval",
           ipAddress: req?.ip,
         },
-        { transaction: t }
+        { transaction: t },
       );
 
       return documentApproval;
@@ -139,16 +184,34 @@ class ApprovalEngineService {
     });
 
     await NotificationHookService.fire(EVENT.SUBMITTED, {
+      models,
       documentId: document.id,
       documentApprovalId: result.id,
       tenantId: document.tenantId,
       levelNumber: 1,
+      actorId: user.id,
+      recipientUserIds: [
+        ...new Set(
+          (levels[0]?.assignments || [])
+            .map((assignment) => assignment.approverUserId)
+            .filter(Boolean),
+        ),
+      ],
     });
     await NotificationHookService.fire(EVENT.PENDING_APPROVAL, {
+      models,
       documentId: document.id,
       documentApprovalId: result.id,
       tenantId: document.tenantId,
       levelNumber: 1,
+      actorId: user.id,
+      recipientUserIds: [
+        ...new Set(
+          (levels[0]?.assignments || [])
+            .map((assignment) => assignment.approverUserId)
+            .filter(Boolean),
+        ),
+      ],
     });
 
     return { required: true, documentApproval: result };
@@ -162,10 +225,7 @@ class ApprovalEngineService {
   static userCanActOnLevel(user, level, workflow, uploaderId) {
     if (!level) return false;
 
-    if (
-      String(user.id) === String(uploaderId) &&
-      !workflow.allowSelfApproval
-    ) {
+    if (String(user.id) === String(uploaderId) && !workflow.allowSelfApproval) {
       return false;
     }
 
@@ -192,24 +252,40 @@ class ApprovalEngineService {
   }
 
   static async _loadForAction(models, documentApprovalId) {
-    const { DocumentApproval, ApprovalWorkflow, ApprovalLevel, ApprovalAssignment, Document } = models;
-    const documentApproval = await DocumentApproval.findByPk(documentApprovalId, {
-      include: [
-        {
-          model: ApprovalWorkflow,
-          include: [
-            {
-              model: ApprovalLevel,
-              as: "levels",
-              where: { status: "ACTIVE" },
-              required: false,
-              include: [{ model: ApprovalAssignment, as: "assignments", where: { status: "ACTIVE" }, required: false }],
-            },
-          ],
-        },
-        { model: Document },
-      ],
-    });
+    const {
+      DocumentApproval,
+      ApprovalWorkflow,
+      ApprovalLevel,
+      ApprovalAssignment,
+      Document,
+    } = models;
+    const documentApproval = await DocumentApproval.findByPk(
+      documentApprovalId,
+      {
+        include: [
+          {
+            model: ApprovalWorkflow,
+            include: [
+              {
+                model: ApprovalLevel,
+                as: "levels",
+                where: { status: "ACTIVE" },
+                required: false,
+                include: [
+                  {
+                    model: ApprovalAssignment,
+                    as: "assignments",
+                    where: { status: "ACTIVE" },
+                    required: false,
+                  },
+                ],
+              },
+            ],
+          },
+          { model: Document },
+        ],
+      },
+    );
     return documentApproval;
   }
 
@@ -225,14 +301,19 @@ class ApprovalEngineService {
   static async approve({ documentApprovalId, user, comments, req }) {
     const models = req.models;
     const { ApprovalHistory } = models;
-    const documentApproval = await ApprovalEngineService._loadForAction(models, documentApprovalId);
+    const documentApproval = await ApprovalEngineService._loadForAction(
+      models,
+      documentApprovalId,
+    );
     if (!documentApproval) {
       const err = new Error("Approval record not found");
       err.statusCode = 404;
       throw err;
     }
     if (!IN_PROGRESS_STATUSES.includes(documentApproval.status)) {
-      const err = new Error(`Document is not pending approval (current status: ${documentApproval.status})`);
+      const err = new Error(
+        `Document is not pending approval (current status: ${documentApproval.status})`,
+      );
       err.statusCode = 409;
       throw err;
     }
@@ -240,28 +321,44 @@ class ApprovalEngineService {
     const workflow = documentApproval.ApprovalWorkflow;
     const level = ApprovalEngineService._currentLevelOf(documentApproval);
     if (!level) {
-      const err = new Error("Approval level configuration is missing or inactive");
+      const err = new Error(
+        "Approval level configuration is missing or inactive",
+      );
       err.statusCode = 500;
       throw err;
     }
 
-    if (!ApprovalEngineService.userCanActOnLevel(user, level, workflow, documentApproval.Document.uploadedBy)) {
-      const err = new Error("You are not authorized to approve at the current level");
+    if (
+      !ApprovalEngineService.userCanActOnLevel(
+        user,
+        level,
+        workflow,
+        documentApproval.Document.uploadedBy,
+      )
+    ) {
+      const err = new Error(
+        "You are not authorized to approve at the current level",
+      );
       err.statusCode = 403;
       throw err;
     }
 
     const oldStatus = documentApproval.status;
-    const isFinalLevel = documentApproval.currentLevel >= documentApproval.totalLevels;
-    const newStatus = isFinalLevel ? STATUS.APPROVED : STATUS.PARTIALLY_APPROVED;
+    const isFinalLevel =
+      documentApproval.currentLevel >= documentApproval.totalLevels;
+    const newStatus = isFinalLevel
+      ? STATUS.APPROVED
+      : STATUS.PARTIALLY_APPROVED;
 
     await documentApproval.sequelize.transaction(async (t) => {
       await documentApproval.update(
         {
           status: newStatus,
-          currentLevel: isFinalLevel ? documentApproval.currentLevel : documentApproval.currentLevel + 1,
+          currentLevel: isFinalLevel
+            ? documentApproval.currentLevel
+            : documentApproval.currentLevel + 1,
         },
-        { transaction: t }
+        { transaction: t },
       );
 
       await ApprovalHistory.create(
@@ -278,7 +375,7 @@ class ApprovalEngineService {
           comments: comments || null,
           ipAddress: req?.ip,
         },
-        { transaction: t }
+        { transaction: t },
       );
     });
 
@@ -294,21 +391,37 @@ class ApprovalEngineService {
     });
 
     await NotificationHookService.fire(EVENT.APPROVED, {
+      models,
+      tenantId: documentApproval.tenantId,
       documentId: documentApproval.documentId,
       documentApprovalId: documentApproval.id,
       levelNumber: level.levelNumber,
+      actorId: user.id,
       isFinalLevel,
+      recipientUserIds: [documentApproval.submittedBy].filter(Boolean),
     });
 
-    let sapResult = null;
+        let sapResult = null;
     if (isFinalLevel) {
-      // SAP Upload happens ONLY after final approval — never before.
-      sapResult = await finalizeDocumentToSap(documentApproval.Document, req);
-      await documentApproval.update({ status: STATUS.COMPLETED, completedAt: new Date() });
+      // Finalization happens ONLY after final approval — never before.
+      // Routes to SAP or local storage depending on the tenant's ERP
+      // status (see finalizeApprovedDocument above) — a Non-ERP tenant
+      // must never hard-fail here just because it has no ErpConfig.
+      sapResult = await finalizeApprovedDocument(documentApproval.Document, req);
+      await documentApproval.update({
+        status: STATUS.COMPLETED,
+        completedAt: new Date(),
+      });
       await NotificationHookService.fire(EVENT.COMPLETED, {
+        models,
+        tenantId: documentApproval.tenantId,
         documentId: documentApproval.documentId,
         documentApprovalId: documentApproval.id,
-        sapDocumentId: sapResult.sapDocumentId,
+        actorId: user.id,
+        recipientUserIds: [documentApproval.submittedBy].filter(Boolean),
+        metadata: sapResult.usedSap
+          ? { sapDocumentId: sapResult.sapDocumentId }
+          : { localFilePath: sapResult.localFilePath },
       });
     }
 
@@ -318,14 +431,19 @@ class ApprovalEngineService {
   static async reject({ documentApprovalId, user, reason, req }) {
     const models = req.models;
     const { ApprovalHistory } = models;
-    const documentApproval = await ApprovalEngineService._loadForAction(models, documentApprovalId);
+    const documentApproval = await ApprovalEngineService._loadForAction(
+      models,
+      documentApprovalId,
+    );
     if (!documentApproval) {
       const err = new Error("Approval record not found");
       err.statusCode = 404;
       throw err;
     }
     if (!IN_PROGRESS_STATUSES.includes(documentApproval.status)) {
-      const err = new Error(`Document is not pending approval (current status: ${documentApproval.status})`);
+      const err = new Error(
+        `Document is not pending approval (current status: ${documentApproval.status})`,
+      );
       err.statusCode = 409;
       throw err;
     }
@@ -333,8 +451,17 @@ class ApprovalEngineService {
     const workflow = documentApproval.ApprovalWorkflow;
     const level = ApprovalEngineService._currentLevelOf(documentApproval);
 
-    if (!ApprovalEngineService.userCanActOnLevel(user, level, workflow, documentApproval.Document.uploadedBy)) {
-      const err = new Error("You are not authorized to reject at the current level");
+    if (
+      !ApprovalEngineService.userCanActOnLevel(
+        user,
+        level,
+        workflow,
+        documentApproval.Document.uploadedBy,
+      )
+    ) {
+      const err = new Error(
+        "You are not authorized to reject at the current level",
+      );
       err.statusCode = 403;
       throw err;
     }
@@ -354,9 +481,12 @@ class ApprovalEngineService {
           rejectedAt: new Date(),
           rejectReason: reason,
         },
-        { transaction: t }
+        { transaction: t },
       );
-      await documentApproval.Document.update({ uploadStatus: "REJECTED" }, { transaction: t });
+      await documentApproval.Document.update(
+        { uploadStatus: "REJECTED" },
+        { transaction: t },
+      );
 
       await ApprovalHistory.create(
         {
@@ -372,7 +502,7 @@ class ApprovalEngineService {
           rejectReason: reason,
           ipAddress: req?.ip,
         },
-        { transaction: t }
+        { transaction: t },
       );
     });
 
@@ -388,10 +518,18 @@ class ApprovalEngineService {
     });
 
     await NotificationHookService.fire(EVENT.REJECTED, {
-      documentId: documentApproval.documentId,
-      documentApprovalId: documentApproval.id,
-      reason,
-    });
+  models,
+  tenantId: documentApproval.tenantId,
+  documentId: documentApproval.documentId,
+  documentApprovalId: documentApproval.id,
+  actorId: user.id,
+  recipientUserIds: [
+    documentApproval.submittedBy,
+  ].filter(Boolean),
+  metadata: {
+    reason,
+  },
+});
 
     return documentApproval;
   }
@@ -399,14 +537,19 @@ class ApprovalEngineService {
   static async sendBack({ documentApprovalId, user, comments, req }) {
     const models = req.models;
     const { ApprovalHistory } = models;
-    const documentApproval = await ApprovalEngineService._loadForAction(models, documentApprovalId);
+    const documentApproval = await ApprovalEngineService._loadForAction(
+      models,
+      documentApprovalId,
+    );
     if (!documentApproval) {
       const err = new Error("Approval record not found");
       err.statusCode = 404;
       throw err;
     }
     if (!IN_PROGRESS_STATUSES.includes(documentApproval.status)) {
-      const err = new Error(`Document is not pending approval (current status: ${documentApproval.status})`);
+      const err = new Error(
+        `Document is not pending approval (current status: ${documentApproval.status})`,
+      );
       err.statusCode = 409;
       throw err;
     }
@@ -414,8 +557,17 @@ class ApprovalEngineService {
     const workflow = documentApproval.ApprovalWorkflow;
     const level = ApprovalEngineService._currentLevelOf(documentApproval);
 
-    if (!ApprovalEngineService.userCanActOnLevel(user, level, workflow, documentApproval.Document.uploadedBy)) {
-      const err = new Error("You are not authorized to send back at the current level");
+    if (
+      !ApprovalEngineService.userCanActOnLevel(
+        user,
+        level,
+        workflow,
+        documentApproval.Document.uploadedBy,
+      )
+    ) {
+      const err = new Error(
+        "You are not authorized to send back at the current level",
+      );
       err.statusCode = 403;
       throw err;
     }
@@ -423,7 +575,10 @@ class ApprovalEngineService {
     const oldStatus = documentApproval.status;
 
     await documentApproval.sequelize.transaction(async (t) => {
-      await documentApproval.update({ status: STATUS.SENT_BACK, currentLevel: 1 }, { transaction: t });
+      await documentApproval.update(
+        { status: STATUS.SENT_BACK, currentLevel: 1 },
+        { transaction: t },
+      );
 
       await ApprovalHistory.create(
         {
@@ -439,7 +594,7 @@ class ApprovalEngineService {
           comments: comments || null,
           ipAddress: req?.ip,
         },
-        { transaction: t }
+        { transaction: t },
       );
     });
 
@@ -454,10 +609,19 @@ class ApprovalEngineService {
       status: AUDIT_STATUS.SUCCESS,
     });
 
-    await NotificationHookService.fire(EVENT.SENT_BACK, {
-      documentId: documentApproval.documentId,
-      documentApprovalId: documentApproval.id,
-    });
+   await NotificationHookService.fire(EVENT.SENT_BACK, {
+  models,
+  tenantId: documentApproval.tenantId,
+  documentId: documentApproval.documentId,
+  documentApprovalId: documentApproval.id,
+  actorId: user.id,
+  recipientUserIds: [
+    documentApproval.submittedBy,
+  ].filter(Boolean),
+  metadata: {
+    comments,
+  },
+});
 
     return documentApproval;
   }
@@ -465,14 +629,21 @@ class ApprovalEngineService {
   static async cancel({ documentApprovalId, user, reason, req }) {
     const models = req.models;
     const { ApprovalHistory } = models;
-    const documentApproval = await ApprovalEngineService._loadForAction(models, documentApprovalId);
+    const documentApproval = await ApprovalEngineService._loadForAction(
+      models,
+      documentApprovalId,
+    );
     if (!documentApproval) {
       const err = new Error("Approval record not found");
       err.statusCode = 404;
       throw err;
     }
-    if ([STATUS.COMPLETED, STATUS.CANCELLED].includes(documentApproval.status)) {
-      const err = new Error(`Cannot cancel a document in status ${documentApproval.status}`);
+    if (
+      [STATUS.COMPLETED, STATUS.CANCELLED].includes(documentApproval.status)
+    ) {
+      const err = new Error(
+        `Cannot cancel a document in status ${documentApproval.status}`,
+      );
       err.statusCode = 409;
       throw err;
     }
@@ -480,7 +651,9 @@ class ApprovalEngineService {
     const isOwner = String(documentApproval.submittedBy) === String(user.id);
     const isAdmin = ["SuperAdmin", "TenantAdmin"].includes(user.role);
     if (!isOwner && !isAdmin) {
-      const err = new Error("Only the submitter or a Tenant Admin can cancel this approval");
+      const err = new Error(
+        "Only the submitter or a Tenant Admin can cancel this approval",
+      );
       err.statusCode = 403;
       throw err;
     }
@@ -488,7 +661,10 @@ class ApprovalEngineService {
     const oldStatus = documentApproval.status;
 
     await documentApproval.sequelize.transaction(async (t) => {
-      await documentApproval.update({ status: STATUS.CANCELLED }, { transaction: t });
+      await documentApproval.update(
+        { status: STATUS.CANCELLED },
+        { transaction: t },
+      );
 
       await ApprovalHistory.create(
         {
@@ -504,7 +680,7 @@ class ApprovalEngineService {
           comments: reason || null,
           ipAddress: req?.ip,
         },
-        { transaction: t }
+        { transaction: t },
       );
     });
 
@@ -520,9 +696,18 @@ class ApprovalEngineService {
     });
 
     await NotificationHookService.fire(EVENT.CANCELLED, {
-      documentId: documentApproval.documentId,
-      documentApprovalId: documentApproval.id,
-    });
+  models,
+  tenantId: documentApproval.tenantId,
+  documentId: documentApproval.documentId,
+  documentApprovalId: documentApproval.id,
+  actorId: user.id,
+  recipientUserIds: [
+    documentApproval.submittedBy,
+  ].filter(Boolean),
+  metadata: {
+    reason,
+  },
+});
 
     return documentApproval;
   }
@@ -530,14 +715,21 @@ class ApprovalEngineService {
   static async resubmit({ documentApprovalId, user, req }) {
     const models = req.models;
     const { ApprovalHistory } = models;
-    const documentApproval = await ApprovalEngineService._loadForAction(models, documentApprovalId);
+    const documentApproval = await ApprovalEngineService._loadForAction(
+      models,
+      documentApprovalId,
+    );
     if (!documentApproval) {
       const err = new Error("Approval record not found");
       err.statusCode = 404;
       throw err;
     }
-    if (![STATUS.SENT_BACK, STATUS.REJECTED].includes(documentApproval.status)) {
-      const err = new Error(`Only a SENT_BACK or REJECTED document can be resubmitted (current: ${documentApproval.status})`);
+    if (
+      ![STATUS.SENT_BACK, STATUS.REJECTED].includes(documentApproval.status)
+    ) {
+      const err = new Error(
+        `Only a SENT_BACK or REJECTED document can be resubmitted (current: ${documentApproval.status})`,
+      );
       err.statusCode = 409;
       throw err;
     }
@@ -545,7 +737,9 @@ class ApprovalEngineService {
     const isOwner = String(documentApproval.submittedBy) === String(user.id);
     const isAdmin = ["SuperAdmin", "TenantAdmin"].includes(user.role);
     if (!isOwner && !isAdmin) {
-      const err = new Error("Only the original submitter or a Tenant Admin can resubmit");
+      const err = new Error(
+        "Only the original submitter or a Tenant Admin can resubmit",
+      );
       err.statusCode = 403;
       throw err;
     }
@@ -562,9 +756,12 @@ class ApprovalEngineService {
           rejectedAt: null,
           rejectReason: null,
         },
-        { transaction: t }
+        { transaction: t },
       );
-      await documentApproval.Document.update({ uploadStatus: "WAITING_FOR_APPROVAL" }, { transaction: t });
+      await documentApproval.Document.update(
+        { uploadStatus: "WAITING_FOR_APPROVAL" },
+        { transaction: t },
+      );
 
       await ApprovalHistory.create(
         {
@@ -579,7 +776,7 @@ class ApprovalEngineService {
           newStatus: STATUS.PENDING_APPROVAL,
           ipAddress: req?.ip,
         },
-        { transaction: t }
+        { transaction: t },
       );
     });
 
@@ -595,17 +792,38 @@ class ApprovalEngineService {
     });
 
     await NotificationHookService.fire(EVENT.SUBMITTED, {
-      documentId: documentApproval.documentId,
-      documentApprovalId: documentApproval.id,
-      levelNumber: 1,
-    });
+  models,
+  tenantId: documentApproval.tenantId,
+  documentId: documentApproval.documentId,
+  documentApprovalId: documentApproval.id,
+  levelNumber: 1,
+  actorId: user.id,
+  recipientUserIds: [
+    ...new Set(
+      (
+        documentApproval.ApprovalWorkflow?.levels
+          ?.find((l) => l.levelNumber === 1)
+          ?.assignments || []
+      )
+        .map((assignment) => assignment.approverUserId)
+        .filter(Boolean)
+    ),
+  ],
+});
 
     return documentApproval;
   }
 
-  static async addComment({ documentApprovalId, user, comment, levelNumber, req }) {
+  static async addComment({
+    documentApprovalId,
+    user,
+    comment,
+    levelNumber,
+    req,
+  }) {
     const { DocumentApproval, ApprovalComment } = req.models;
-    const documentApproval = await DocumentApproval.findByPk(documentApprovalId);
+    const documentApproval =
+      await DocumentApproval.findByPk(documentApprovalId);
     if (!documentApproval) {
       const err = new Error("Approval record not found");
       err.statusCode = 404;
@@ -625,10 +843,19 @@ class ApprovalEngineService {
    */
   static async getPendingForUser(req) {
     const models = req.models;
-    const { DocumentApproval, ApprovalWorkflow, ApprovalLevel, ApprovalAssignment, Document } = models;
+    const {
+      DocumentApproval,
+      ApprovalWorkflow,
+      ApprovalLevel,
+      ApprovalAssignment,
+      Document,
+    } = models;
     const user = req.user;
     const candidates = await DocumentApproval.findAll({
-      where: { tenantId: user.tenantId, status: [STATUS.PENDING_APPROVAL, STATUS.PARTIALLY_APPROVED] },
+      where: {
+        tenantId: user.tenantId,
+        status: [STATUS.PENDING_APPROVAL, STATUS.PARTIALLY_APPROVED],
+      },
       include: [
         {
           model: ApprovalWorkflow,
@@ -638,7 +865,14 @@ class ApprovalEngineService {
               as: "levels",
               where: { status: "ACTIVE" },
               required: false,
-              include: [{ model: ApprovalAssignment, as: "assignments", where: { status: "ACTIVE" }, required: false }],
+              include: [
+                {
+                  model: ApprovalAssignment,
+                  as: "assignments",
+                  where: { status: "ACTIVE" },
+                  required: false,
+                },
+              ],
             },
           ],
         },
@@ -649,7 +883,12 @@ class ApprovalEngineService {
 
     return candidates.filter((da) => {
       const level = ApprovalEngineService._currentLevelOf(da);
-      const canAct = ApprovalEngineService.userCanActOnLevel(user, level, da.ApprovalWorkflow, da.Document?.uploadedBy);
+      const canAct = ApprovalEngineService.userCanActOnLevel(
+        user,
+        level,
+        da.ApprovalWorkflow,
+        da.Document?.uploadedBy,
+      );
       console.log("[APPROVAL DEBUG]", {
         documentApprovalId: da.id,
         documentApprovalTenantId: da.tenantId,
@@ -658,7 +897,12 @@ class ApprovalEngineService {
         userRole: user.role,
         uploadedBy: da.Document?.uploadedBy,
         levelFound: !!level,
-        levelAssignments: level?.assignments?.map(a => ({ type: a.approverType, role: a.approverRole, userId: a.approverUserId, status: a.status })),
+        levelAssignments: level?.assignments?.map((a) => ({
+          type: a.approverType,
+          role: a.approverRole,
+          userId: a.approverUserId,
+          status: a.status,
+        })),
         canAct,
       });
       return canAct;
@@ -682,7 +926,16 @@ class ApprovalEngineService {
   }
 
   static async getDetails(req, documentApprovalId) {
-    const { DocumentApproval, ApprovalWorkflow, ApprovalLevel, ApprovalAssignment, Document, ApprovalHistory, ApprovalComment, User } = req.models;
+    const {
+      DocumentApproval,
+      ApprovalWorkflow,
+      ApprovalLevel,
+      ApprovalAssignment,
+      Document,
+      ApprovalHistory,
+      ApprovalComment,
+      User,
+    } = req.models;
     return DocumentApproval.findByPk(documentApprovalId, {
       include: [
         {
@@ -696,8 +949,18 @@ class ApprovalEngineService {
           ],
         },
         { model: Document },
-        { model: ApprovalHistory, as: "history", separate: true, order: [["createdAt", "ASC"]] },
-        { model: ApprovalComment, as: "comments", separate: true, order: [["createdAt", "ASC"]] },
+        {
+          model: ApprovalHistory,
+          as: "history",
+          separate: true,
+          order: [["createdAt", "ASC"]],
+        },
+        {
+          model: ApprovalComment,
+          as: "comments",
+          separate: true,
+          order: [["createdAt", "ASC"]],
+        },
         { model: User, as: "submitter", attributes: ["id", "name", "email"] },
       ],
     });
