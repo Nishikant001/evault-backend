@@ -78,7 +78,7 @@ const listMasters = async (req, res) => {
     const { search, status, departmentId, categoryId } = req.query;
     const { page, limit, offset } = pagination(req.query);
 
-    let rows, count;
+        let rows, count;
 
     if (type === "departments") {
       // Global master — scoped to what's assigned to this tenant.
@@ -101,7 +101,12 @@ const listMasters = async (req, res) => {
         order: [[Department, "name", "ASC"]],
       });
       count = total;
-      rows = assignments.map((a) => a.Department);
+      // erpConfigId lives on the TenantDepartment assignment, not on the
+      // shared global Department row — merge it in.
+      rows = assignments.map((a) => ({
+        ...a.Department.get({ plain: true }),
+        erpConfigId: a.erpConfigId,
+      }));
     } else {
       const where = { tenantId, status: "ACTIVE" };
       if (search) {
@@ -120,6 +125,12 @@ const listMasters = async (req, res) => {
       count = result.count;
     }
 
+    const erpConfigIds = [...new Set(rows.map((r) => r.erpConfigId).filter(Boolean))];
+    const erpConfigs = erpConfigIds.length
+      ? await req.masterModels.ErpConfig.findAll({ where: { id: erpConfigIds }, attributes: ["id", "name"], raw: true })
+      : [];
+    const erpConfigMap = Object.fromEntries(erpConfigs.map((e) => [e.id, e.name]));
+
     const data = rows.map((r) => ({
       id: r.id,
       sapCode: r.sapCode,
@@ -128,9 +139,7 @@ const listMasters = async (req, res) => {
       syncStatus: deriveMasterStatus(r),
       lastSyncTime: r.lastSyncedAt,
       source: r.sapCode ? "SAP" : "LOCAL",
-      // Parent references so the frontend can reliably filter
-      // Categories by Department / Document Types by Category
-      // client-side, even if a server-side query filter is bypassed.
+      erpSourceName: erpConfigMap[r.erpConfigId] || null,
       ...(type === "categories" ? { departmentId: r.departmentId } : {}),
       ...(type === "document-types" ? { categoryId: r.categoryId } : {}),
     }));
@@ -195,7 +204,13 @@ const listSyncDocuments = async (req, res) => {
       limit,
       offset,
     });
-    await hydrateDepartments(req.masterModels, rows.map((r) => r.dataValues));
+        await hydrateDepartments(req.masterModels, rows.map((r) => r.dataValues));
+
+    const erpConfigIds = [...new Set(rows.map((r) => r.erpConfigId).filter(Boolean))];
+    const erpConfigs = erpConfigIds.length
+      ? await req.masterModels.ErpConfig.findAll({ where: { id: erpConfigIds }, attributes: ["id", "name"], raw: true })
+      : [];
+    const erpConfigMap = Object.fromEntries(erpConfigs.map((e) => [e.id, e.name]));
 
     const sapDocIds = rows.map((r) => r.sapDocumentId).filter(Boolean);
     const retryCounts = sapDocIds.length
@@ -217,7 +232,8 @@ const listSyncDocuments = async (req, res) => {
       classificationStatus:
         d.departmentId && d.categoryId && d.documentTypeId ? "COMPLETE" : "PENDING",
       mappedStatus: d.departmentId && d.categoryId && d.documentTypeId ? "MAPPED" : "UNMAPPED",
-      importDate: d.createdAt,
+           importDate: d.createdAt,
+      erpSource: erpConfigMap[d.erpConfigId] || "—",
       syncStatus: d.sapSyncStatus,
       retryCount: retryMap[d.sapDocumentId] || 0,
     }));
@@ -664,18 +680,73 @@ const updateSettings = async (req, res) => {
 };
 
 // POST /api/sap-sync/settings/test-connection
+// MULTI-ERP FIX: this previously ALWAYS tested `tenant.ErpConfig` — the
+// legacy single-ERP association — even when the Settings page had an
+// explicit ERP selected and sent it as `erpConfigId` in the request body
+// (SapSyncApi.testConnection(erpConfigId) has sent this all along; the
+// controller just never read it). For a tenant with multiple active SAP
+// ERP connections this meant "Connection Test" silently tested the
+// wrong ERP whenever the selected one wasn't the tenant's default.
+//
+// Now:
+//   - erpConfigId given -> verified to belong to this tenant (and be
+//     active) via TenantErpConnection, then tested. Never silently
+//     substitutes a different ERP.
+//   - erpConfigId omitted -> falls back to the legacy tenant.ErpConfig
+//     association, unchanged from before. Single-ERP tenants (the
+//     common case, where the frontend selector is hidden and never
+//     sends erpConfigId) see zero behavior change.
 const testTenantConnection = async (req, res) => {
   try {
     const tenantId = resolveTenantId(req);
     if (!tenantId) return res.status(400).json({ success: false, message: "tenantId is required" });
-    const { Tenant, ErpConfig } = req.masterModels;
-    const tenant = await Tenant.findByPk(tenantId, { include: [{ model: ErpConfig }] });
-    if (!tenant || !tenant.ErpConfig) {
-      return res.status(400).json({ success: false, message: "No ERP configuration assigned to this tenant" });
+
+    const rawErpConfigId = req.body?.erpConfigId ?? req.query?.erpConfigId;
+    const erpConfigId =
+      rawErpConfigId !== undefined && rawErpConfigId !== null && rawErpConfigId !== ""
+        ? parseInt(rawErpConfigId, 10)
+        : undefined;
+
+    let erpConfig;
+
+    if (erpConfigId !== undefined) {
+      if (!Number.isInteger(erpConfigId)) {
+        return res.status(400).json({ success: false, message: "erpConfigId must be a valid integer" });
+      }
+
+      const { TenantErpConnection, ErpConfig } = req.masterModels;
+      const connection = await TenantErpConnection.findOne({
+        where: { tenantId, erpConfigId, isActive: true },
+        include: [{ model: ErpConfig, as: "erpConfig", required: true }],
+      });
+
+      if (!connection) {
+        return res.status(403).json({
+          success: false,
+          message: "The requested ERP configuration is not assigned to this tenant or is inactive",
+        });
+      }
+
+      erpConfig = connection.erpConfig;
+    } else {
+      const { Tenant, ErpConfig } = req.masterModels;
+      const tenant = await Tenant.findByPk(tenantId, { include: [{ model: ErpConfig }] });
+      if (!tenant || !tenant.ErpConfig) {
+        return res.status(400).json({ success: false, message: "No ERP configuration assigned to this tenant" });
+      }
+      erpConfig = tenant.ErpConfig;
     }
-    await SapService.testConnection(tenant.ErpConfig, () => {});
-    await tenant.ErpConfig.update({ status: "CONNECTED" });
-    return res.json({ success: true, message: "Connection successful", data: { erpConfigName: tenant.ErpConfig.name } });
+
+    // MULTI-ERP FIX: this resolved the CORRECT erpConfig (SAP, Oracle, or
+    // Custom — whichever the tenant selected) above, but then always ran
+    // it through SapService.testConnection() regardless of erpType. For a
+    // non-SAP connection that meant "Test Connection" silently ran SAP's
+    // CSRF/OData probe against, say, an Oracle REST endpoint and failed.
+    // Route through ErpFactory like every other ERP-facing call.
+    const erpService = ErpFactory.getService(erpConfig);
+    await erpService.testConnection(erpConfig, () => {});
+    await erpConfig.update({ status: "CONNECTED" });
+    return res.json({ success: true, message: "Connection successful", data: { erpConfigId: erpConfig.id, erpConfigName: erpConfig.name } });
   } catch (error) {
     return res.status(400).json({ success: false, message: error.message });
   }

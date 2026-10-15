@@ -48,16 +48,20 @@ async function withTenantLock(tenantId, fn) {
   }
 }
 
-async function runMasterSync({ tenantId, triggerType, triggeredBy }) {
+async function runMasterSync({ tenantId, triggerType, triggeredBy, erpConfigId }) {
   return withTenantLock(tenantId, async () => {
     console.log("STEP-1");
 
     const tenant = await masterModels.Tenant.findByPk(tenantId, { include: [{ model: masterModels.ErpConfig }] });
     console.log("STEP-2", tenant);
 
+    // Best-effort initial stamp (legacy single-ERP association, or the
+    // explicit erpConfigId if one was passed). Corrected below to the ERP
+    // that actually ran once syncMasters resolves it via
+    // TenantErpConnection — see PHASE 2 (multi-ERP sync) comment there.
     const logRow = await SapSyncLogService.startLog({
       tenantId,
-      erpConfigId: tenant?.ErpConfig?.id,
+      erpConfigId: erpConfigId || tenant?.ErpConfig?.id,
       syncType: SAP_SYNC_TYPE.MASTER,
       triggerType,
       triggeredBy,
@@ -67,9 +71,14 @@ async function runMasterSync({ tenantId, triggerType, triggeredBy }) {
       const result = await MasterSyncService.syncMasters({
         tenantId,
         sapSyncLogId: logRow.id,
+        erpConfigId,
       });
 
       console.log("SYNC RESULT:", result);
+
+      if (result.erpConfigId && result.erpConfigId !== logRow.erpConfigId) {
+        await logRow.update({ erpConfigId: result.erpConfigId });
+      }
 
       await SapSyncLogService.finishLog(logRow, result);
       return { logId: logRow.id, ...result };
@@ -84,19 +93,25 @@ async function runMasterSync({ tenantId, triggerType, triggeredBy }) {
   });
 }
 
-async function runDocumentSync({ tenantId, triggerType, triggeredBy }) {
+async function runDocumentSync({ tenantId, triggerType, triggeredBy, erpConfigId }) {
   return withTenantLock(tenantId, async () => {
     const tenant = await masterModels.Tenant.findByPk(tenantId, { include: [{ model: masterModels.ErpConfig }] });
+    // See runMasterSync() above — same best-effort stamp + correction.
     const logRow = await SapSyncLogService.startLog({
       tenantId,
-      erpConfigId: tenant?.ErpConfig?.id,
+      erpConfigId: erpConfigId || tenant?.ErpConfig?.id,
       syncType: SAP_SYNC_TYPE.DOCUMENT,
       triggerType,
       triggeredBy,
     });
 
     try {
-      const result = await DocumentSyncService.syncDocuments({ tenantId, sapSyncLogId: logRow.id });
+      const result = await DocumentSyncService.syncDocuments({ tenantId, sapSyncLogId: logRow.id, erpConfigId });
+
+      if (result.erpConfigId && result.erpConfigId !== logRow.erpConfigId) {
+        await logRow.update({ erpConfigId: result.erpConfigId });
+      }
+
       await SapSyncLogService.finishLog(logRow, result);
       return { logId: logRow.id, ...result };
     } catch (error) {
@@ -163,8 +178,10 @@ function retryFnFor(entityType, tenantId) {
         }
       };
     case SAP_SYNC_ENTITY_TYPE.DOCUMENT:
-      return async (mapped) => {
-        await DocumentSyncService.retryDocumentRecord(tenantId, mapped);
+      // `item` is the Retry Queue row (2nd arg from processDueItems); its
+      // erpConfigId makes the retry use the ERP that originally failed.
+      return async (mapped, item) => {
+        await DocumentSyncService.retryDocumentRecord(tenantId, mapped, item?.erpConfigId || undefined);
       };
     default:
       return async () => {
@@ -178,12 +195,14 @@ function retryFnFor(entityType, tenantId) {
  * one entityType). Groups by entityType internally since each type needs
  * a different retry function.
  */
-async function runRetry({ tenantId, entityType, triggerType, triggeredBy }) {
+async function runRetry({ tenantId, entityType, erpConfigId, triggerType, triggeredBy }) {
   return withTenantLock(tenantId, async () => {
     const tenant = await masterModels.Tenant.findByPk(tenantId, { include: [{ model: masterModels.ErpConfig }] });
     const logRow = await SapSyncLogService.startLog({
       tenantId,
-      erpConfigId: tenant?.ErpConfig?.id,
+      // MULTI-ERP FIX: log against the ERP being retried when one was
+      // explicitly selected.
+      erpConfigId: erpConfigId || tenant?.ErpConfig?.id,
       syncType: entityType === SAP_SYNC_ENTITY_TYPE.DOCUMENT ? SAP_SYNC_TYPE.DOCUMENT : SAP_SYNC_TYPE.MASTER,
       triggerType: triggerType || "RETRY",
       triggeredBy,
@@ -206,6 +225,7 @@ async function runRetry({ tenantId, entityType, triggerType, triggeredBy }) {
       for (const type of entityTypes) {
         const outcome = await RetryQueueService.processDueItems({
           tenantId,
+          erpConfigId,
           entityType: type,
           retryFn: retryFnFor(type, tenantId),
         });

@@ -47,6 +47,7 @@ function defineTenantModels(sequelize) {
   const MetadataTemplateVersion = require("./MetadataTemplateVersion")(sequelize);
   const MetadataField = require("./MetadataField")(sequelize);
   const OcrAlias = require("./OcrAlias")(sequelize);
+  const OcrSettings = require("./OcrSettings")(sequelize);
   const DocumentMetadata = require("./DocumentMetadata")(sequelize);
   const TemplateAssignment = require("./TemplateAssignment")(sequelize);
   const AIProvider = require("./AIProvider")(sequelize);
@@ -353,6 +354,7 @@ DocumentContent.belongsTo(Document, {
     MetadataTemplateVersion,
     MetadataField,
     OcrAlias,
+    OcrSettings,
     DocumentMetadata,
     TemplateAssignment,
     AIProvider,

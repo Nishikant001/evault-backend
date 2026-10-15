@@ -25,12 +25,21 @@ const {
  * across multiple sync runs keeps accumulating history on the SAME row
  * instead of creating duplicates.
  */
-async function enqueue({ tenantId, entityType, referenceCode, payload, error, sapSyncLogId }) {
+async function enqueue({ tenantId, erpConfigId, entityType, referenceCode, payload, error, sapSyncLogId }) {
   const { SapSyncRetryQueue } = (await getTenantConnection(tenantId)).models;
+  // MULTI-ERP FIX: erpConfigId is now part of the idempotency key.
+  // Passing `undefined` here matches existing rows created before this
+  // column existed (erpConfigId IS NULL) — legacy callers that don't know
+  // about ERPs at all keep behaving exactly as before. A caller that DOES
+  // know which ERP produced the failure (sapMasterSyncService /
+  // sapDocumentSyncService, always) passes it explicitly so a record
+  // failing against two different ERPs queues as two separate rows
+  // instead of one row silently losing the other ERP's history.
   const [row, created] = await SapSyncRetryQueue.findOrCreate({
-    where: { tenantId, entityType, referenceCode },
+    where: { tenantId, erpConfigId: erpConfigId ?? null, entityType, referenceCode },
     defaults: {
       tenantId,
+      erpConfigId: erpConfigId ?? null,
       entityType,
       referenceCode,
       payload,
@@ -88,7 +97,7 @@ async function markResolved(row) {
  * Fetches every row due for retry right now, optionally scoped to one
  * tenant and/or one entityType.
  */
-async function getDueItems({ tenantId, entityType, limit = 200 } = {}) {
+async function getDueItems({ tenantId, erpConfigId, entityType, limit = 200 } = {}) {
   if (!tenantId) throw new Error("sapRetryQueueService.getDueItems requires tenantId — SapSyncRetryQueue now lives per-tenant, there is no cross-tenant table to scan.");
   const { SapSyncRetryQueue } = (await getTenantConnection(tenantId)).models;
   const where = {
@@ -96,6 +105,10 @@ async function getDueItems({ tenantId, entityType, limit = 200 } = {}) {
     nextRetryAt: { [Op.lte]: new Date() },
   };
   if (entityType) where.entityType = entityType;
+  // MULTI-ERP FIX: when the caller names a specific ERP, only that ERP's
+  // queued failures are due — never a different ERP's, and never rows
+  // with no ERP attached (those are only picked up by an unscoped retry).
+  if (erpConfigId !== undefined && erpConfigId !== null) where.erpConfigId = erpConfigId;
 
   return SapSyncRetryQueue.findAll({
     where,
@@ -112,8 +125,8 @@ async function getDueItems({ tenantId, entityType, limit = 200 } = {}) {
  *
  * Returns { processed, resolved, stillFailing }.
  */
-async function processDueItems({ tenantId, entityType, retryFn, limit }) {
-  const items = await getDueItems({ tenantId, entityType, limit });
+async function processDueItems({ tenantId, erpConfigId, entityType, retryFn, limit }) {
+  const items = await getDueItems({ tenantId, erpConfigId, entityType, limit });
 
   let resolved = 0;
   let stillFailing = 0;
@@ -127,6 +140,12 @@ async function processDueItems({ tenantId, entityType, retryFn, limit }) {
     } catch (error) {
       await enqueue({
         tenantId: item.tenantId,
+        // MULTI-ERP FIX: keep re-queueing against the SAME ERP that
+        // originally failed — never fall back to whatever erpConfigId
+        // this processDueItems() call happened to be scoped to (matters
+        // for an unscoped/legacy retry pass, where item.erpConfigId may
+        // differ row-to-row).
+        erpConfigId: item.erpConfigId,
         entityType: item.entityType,
         referenceCode: item.referenceCode,
         payload: item.payload,
@@ -140,12 +159,13 @@ async function processDueItems({ tenantId, entityType, retryFn, limit }) {
   return { processed: items.length, resolved, stillFailing };
 }
 
-async function list({ tenantId, status, entityType, page = 1, limit = 25 } = {}) {
+async function list({ tenantId, erpConfigId, status, entityType, page = 1, limit = 25 } = {}) {
   if (!tenantId) throw new Error("sapRetryQueueService.list requires tenantId — SapSyncRetryQueue now lives per-tenant, there is no cross-tenant table to scan.");
   const { SapSyncRetryQueue } = (await getTenantConnection(tenantId)).models;
   const where = {};
   if (status) where.status = status;
   if (entityType) where.entityType = entityType;
+  if (erpConfigId !== undefined && erpConfigId !== null) where.erpConfigId = erpConfigId;
 
   const safePage = Math.max(parseInt(page, 10) || 1, 1);
   const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 25, 1), 200);

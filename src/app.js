@@ -46,9 +46,11 @@ const approvalWorkflowRoutes = require("./routes/approvalWorkflowRoutes"); // NE
 const approvalRoutes         = require("./routes/approvalRoutes");         // NEW (Approval Engine runtime)
 const userAssignmentRoutes   = require("./routes/userAssignmentRoutes");   // NEW (Dynamic User Assignment Engine)
 const sapSyncRoutes          = require("./routes/sapSyncRoutes");          // NEW (SAP Master + Document Synchronization)
+const tenantErpRoutes        = require("./routes/tenantErpRoutes");        // NEW (generic Multi-ERP: all connection types, not just SAP)
 const sapSyncScheduler       = require("./services/sapSyncScheduler");     // NEW (Cron Scheduler for SAP Sync)
 const metadataTemplateRoutes = require("./routes/metadataTemplateRoutes"); // NEW (Dynamic Metadata Template Engine)
 const metadataFieldRoutes    = require("./routes/metadataFieldRoutes");    // NEW (Form Builder fields + OCR aliases)
+const ocrSettingsRoutes     = require("./routes/ocrSettingsRoutes");     // NEW (Tenant OCR engine/provider settings)
 const documentMetadataRoutes = require("./routes/documentMetadataRoutes"); // NEW (per-document dynamic metadata)
 const aiSettingsRoutes      = require("./routes/aiSettingsRoutes");       // NEW (AI Document Assistant — providers + settings)
 const chatRoutes            = require("./routes/chatRoutes");            // NEW (AI Document Assistant — RAG chat)
@@ -163,9 +165,14 @@ app.use("/api/user-assignments",   userAssignmentRoutes);
 // SAP Master Synchronization + SAP Document Synchronization
 app.use("/api/sap-sync",           sapSyncRoutes);
 
+// Generic Multi-ERP: all of a tenant's connections (SAP + Oracle + Custom),
+// generic test-connection, and generic CATEGORY/DOCUMENT_TYPE sync.
+app.use("/api/tenant-erp",         tenantErpRoutes);
+
 // Dynamic Metadata Template Engine (Form Builder: templates, versions, fields, OCR aliases)
 app.use("/api/metadata-templates", metadataTemplateRoutes);
 app.use("/api/metadata-fields",    metadataFieldRoutes);
+app.use("/api/ocr-settings",       ocrSettingsRoutes);
 
 // Per-document dynamic metadata (raw OCR / mapped fields / confidence / corrections)
 app.use("/api/documents",          documentMetadataRoutes);

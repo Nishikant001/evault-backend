@@ -1,10 +1,99 @@
 // PHASE G — ErpConfig is a Master DB model.
 const masterModels = require("../models/masterDb");
-const SapService = require("../services/sapService");
+const ErpFactory = require("../services/erpFactory");
 const SapMetadataService = require("../services/sapMetadataService");
 const AuditService = require("../services/auditService");
 const { AUDIT_ACTIONS, AUDIT_MODULES, AUDIT_STATUS } = require("../constants/auditActions");
 const { encryptSecret } = require("../services/erpCredentialService");
+const {
+  PROTOCOLS,
+  AUTH_TYPES,
+  validateConnectorConfig,
+  computeCapabilities,
+  defaultConnectorConfig,
+  describeSchema,
+  normalizeErpType,
+  defaultProtocolFor,
+} = require("../services/connector/connectorSchema");
+
+// DYNAMIC ERP CONNECTOR (Step 1) ───────────────────────────────────────
+// Shared by create + update. Returns { error } (400 body) or the cleaned
+// values to persist. `current` is the existing row on update.
+function resolveConnectorFields(body, current) {
+  const out = {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+
+  let erpType = current ? current.erpType : undefined;
+  if (has("erpType") || !current) {
+    erpType = normalizeErpType(body.erpType);
+    if (!erpType) {
+      return { error: { message: "erpType must be 2-50 characters: letters, digits or underscore, starting with a letter" } };
+    }
+    out.erpType = erpType;
+  }
+
+  let protocol = current ? current.protocol : undefined;
+  if (has("protocol")) protocol = body.protocol;
+  else if (!current || has("erpType")) protocol = protocol || defaultProtocolFor(erpType);
+  if (!PROTOCOLS.includes(protocol)) {
+    return { error: { message: `protocol must be one of: ${PROTOCOLS.join(", ")}` } };
+  }
+  if (!current || has("protocol") || has("erpType")) out.protocol = protocol;
+
+  if (has("authType") && body.authType !== null && !AUTH_TYPES.includes(body.authType)) {
+    return { error: { message: `authType must be one of: ${AUTH_TYPES.join(", ")}` } };
+  }
+
+  if (has("templateKey")) out.templateKey = body.templateKey || null;
+
+  if (has("connectorConfig")) {
+    if (body.connectorConfig === null) {
+      out.connectorConfig = null;
+    } else {
+      const result = validateConnectorConfig(protocol, body.connectorConfig);
+      if (!result.valid) {
+        return { error: { message: "connectorConfig is invalid", errors: result.errors, warnings: result.warnings } };
+      }
+      out.connectorConfig = result.normalized;
+      out.__warnings = result.warnings;
+    }
+  } else if (current && has("protocol") && current.connectorConfig && protocol !== current.protocol) {
+    // Protocol changed but the old config was written for another protocol.
+    const result = validateConnectorConfig(protocol, current.connectorConfig);
+    if (!result.valid) {
+      return { error: { message: `Existing connectorConfig is not valid for protocol ${protocol}; send a new connectorConfig`, errors: result.errors } };
+    }
+  }
+  return { values: out };
+}
+
+// GET /api/erp-configs/connector-schema — vocabulary for the config UI.
+const getConnectorSchema = (req, res) => {
+  const { protocol } = req.query;
+  const data = describeSchema();
+  if (protocol) {
+    if (!PROTOCOLS.includes(protocol)) {
+      return res.status(400).json({ success: false, message: `protocol must be one of: ${PROTOCOLS.join(", ")}` });
+    }
+    data.starterConfig = defaultConnectorConfig(protocol);
+  }
+  return res.json({ success: true, data });
+};
+
+// POST /api/erp-configs/validate-connector — dry-run validation (no save).
+const validateConnector = (req, res) => {
+  const { protocol, connectorConfig } = req.body || {};
+  const result = validateConnectorConfig(protocol, connectorConfig);
+  return res.json({
+    success: true,
+    data: {
+      valid: result.valid,
+      errors: result.errors,
+      warnings: result.warnings,
+      capabilities: result.valid ? computeCapabilities(result.normalized) : null,
+    },
+  });
+};
 
 // Fields we never want written into audit oldValue/newValue snapshots
 // (credentials) — audit trail should show that config changed, not leak secrets.
@@ -53,6 +142,14 @@ const createErpConfig = async (req, res) => {
     if (!name || !erpType || !["INBOUND", "OUTBOUND", "BOTH"].includes(mode)) {
       return res.status(400).json({ success: false, message: "name, erpType and a valid integrationMode are required" });
     }
+
+    // DYNAMIC ERP CONNECTOR (Step 1): erpType is free text now; protocol /
+    // connectorConfig / templateKey are validated before anything is saved.
+    const connector = resolveConnectorFields(req.body, null);
+    if (connector.error) {
+      return res.status(400).json({ success: false, ...connector.error });
+    }
+    const { __warnings: connectorWarnings, ...connectorValues } = connector.values;
     if (["OUTBOUND", "BOTH"].includes(mode) && !baseUrl) {
       return res.status(400).json({
         success: false,
@@ -75,7 +172,7 @@ const createErpConfig = async (req, res) => {
 
     const erp = await ErpConfig.create({
       name,
-      erpType,
+      ...connectorValues,
       baseUrl: normalizedBaseUrl,
       integrationMode: mode,
       username,
@@ -105,6 +202,7 @@ const createErpConfig = async (req, res) => {
     return res.status(201).json({
       success: true,
       data: sanitizeErpConfig(erp),
+      ...(connectorWarnings && connectorWarnings.length ? { warnings: connectorWarnings } : {}),
     });
   } catch (err) {
     return res.status(500).json({
@@ -131,9 +229,15 @@ const testConnection = async (req, res) => {
       return res.status(400).json({ success: false, message: "Outbound connection test is not available for an inbound-only configuration" });
     }
 
-await SapService.testConnection(erp, (msg) => {
-  console.log(msg);
-});
+    // MULTI-ERP FIX: this always called SapService.testConnection() here,
+    // regardless of erpType — so testing an Oracle or Custom connection ran
+    // SAP's CSRF/OData probe against a non-SAP endpoint and failed (or, for
+    // ERPs the switch didn't even know about, threw before getting this
+    // far). Route through ErpFactory like every other ERP-facing call.
+    const erpService = ErpFactory.getService(erp);
+    await erpService.testConnection(erp, (msg) => {
+      console.log(msg);
+    });
     await erp.update({
       status: "CONNECTED",
     });
@@ -196,6 +300,7 @@ const getErpConfig = async (req, res) => {
     return res.json({
       success: true,
       data: sanitizeErpConfig(erp),
+      ...(connectorWarnings && connectorWarnings.length ? { warnings: connectorWarnings } : {}),
     });
   } catch (err) {
     return res.status(500).json({
@@ -221,7 +326,7 @@ const updateErpConfig = async (req, res) => {
     const oldValue = sanitizeErpConfig(erp);
 
     const allowedFields = [
-      "name", "sapClient", "description", "status", "isDefault", "erpType",
+      "name", "sapClient", "description", "status", "isDefault",
       "baseUrl", "integrationMode", "username", "authType", "inboundUsername", "metadataUrl", "odataVersion",
       "entitySetMap", "fieldMap", "functionMap",
     ];
@@ -230,6 +335,18 @@ const updateErpConfig = async (req, res) => {
       if (Object.prototype.hasOwnProperty.call(req.body, field)) {
         updateData[field] = req.body[field];
       }
+    }
+
+    // DYNAMIC ERP CONNECTOR (Step 1): erpType / protocol / connectorConfig /
+    // templateKey go through the shared validator instead of the raw copy.
+    const connector = resolveConnectorFields(req.body, erp);
+    if (connector.error) {
+      return res.status(400).json({ success: false, ...connector.error });
+    }
+    const { __warnings: connectorWarnings, ...connectorValues } = connector.values;
+    Object.assign(updateData, connectorValues);
+    if (updateData.authType !== undefined && updateData.authType !== null && !AUTH_TYPES.includes(updateData.authType)) {
+      return res.status(400).json({ success: false, message: `authType must be one of: ${AUTH_TYPES.join(", ")}` });
     }
     if (Object.prototype.hasOwnProperty.call(req.body, "inboundPassword")) {
       updateData.inboundPassword = req.body.inboundPassword ? encryptSecret(req.body.inboundPassword) : null;
@@ -307,7 +424,7 @@ const generateInboundCredentials = async (req, res) => {
     const { ErpConfig } = req.masterModels;
     const erp = await ErpConfig.findByPk(req.params.id);
     if (!erp) return res.status(404).json({ success: false, message: "ERP configuration not found" });
-    if (erp.erpType !== "SAP") return res.status(400).json({ success: false, message: "Inbound credentials are currently supported for SAP only" });
+    // if (erp.erpType !== "SAP") return res.status(400).json({ success: false, message: "Inbound credentials are currently supported for SAP only" });
 
     const crypto = require("crypto");
     const username = `evault_${crypto.randomBytes(8).toString("hex")}`;
@@ -382,7 +499,9 @@ const testConnectionStream = async (req, res) => {
       return res.end();
     }
 
-    await SapService.testConnection(erp, send);
+    // MULTI-ERP FIX: same hardcoded-SAP bug as testConnection() above.
+    const erpService = ErpFactory.getService(erp);
+    await erpService.testConnection(erp, send);
 
     await erp.update({
       status: "CONNECTED",
@@ -458,5 +577,6 @@ module.exports = {
   testConnectionStream,
   discoverMetadata,
   validateMapping,
-  
+  getConnectorSchema,
+  validateConnector,
 };

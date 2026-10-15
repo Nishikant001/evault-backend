@@ -4,6 +4,8 @@
 // now, read through req.models. SuperAdmin cross-tenant creation deferred
 // to Phase 7 — same pattern as companyCodeController.js.
 
+const userAssignmentService = require("../services/userAssignmentService");
+
 function resolveTenantId(req) {
   if (req.user.role === "SuperAdmin") return null;
   return req.user.tenantId;
@@ -79,9 +81,31 @@ const listPlants = async (req, res) => {
 
     const { Plant, CompanyCode } = req.models;
     const { companyCodeId } = req.query;
+    const tenantId = req.user.tenantId;
 
-    const where = { tenantId: req.user.tenantId, status: "ACTIVE" };
+    const where = { tenantId, status: "ACTIVE" };
     if (companyCodeId) where.companyCodeId = companyCodeId;
+
+    // Authorization: same rule as Company Codes above — a restricted
+    // user only sees the Plant(s) mapped to their own assigned
+    // department(s), never every plant in the tenant.
+    const scope = await userAssignmentService.resolveScope(
+      req.models,
+      tenantId,
+      req.user.id,
+      req.user.role
+    );
+    if (scope) {
+      const locationScope = await userAssignmentService.resolveLocationScope(
+        req.models,
+        tenantId,
+        scope
+      );
+      if (!locationScope.plantIds.length) {
+        return res.json({ success: true, count: 0, data: [] });
+      }
+      where.id = locationScope.plantIds;
+    }
 
     const plants = await Plant.findAll({
       where,

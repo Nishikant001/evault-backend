@@ -118,10 +118,10 @@ async function resolveClassification(tenantId, mapped) {
  * the document import (Step 4) all run inside this ONE transaction, so a
  * failure at any step rolls back everything — nothing is left half-created.
  */
-async function upsertDocumentRecord(tenantId, mapped, masterCache) {
+async function upsertDocumentRecord(tenantId, mapped, masterCache, erpConfigId) {
   const cache =
     masterCache ||
-    (await HierarchyResolver.loadMasterCache(await getSapErpConfigForTenant(tenantId)));
+    (await HierarchyResolver.loadMasterCache(await getSapErpConfigForTenant(tenantId, erpConfigId)));
 
     const { sequelize: tenantSequelize, models: tenantModels } = await getTenantConnection(tenantId);
   const { Document, Category, DocumentType } = tenantModels;
@@ -157,6 +157,8 @@ async function upsertDocumentRecord(tenantId, mapped, masterCache) {
         originalFileName: mapped.fileName || `SAP_${mapped.sapDocumentId}`,
         mimeType: mapped.mimeType,
         sapDocumentId: mapped.sapDocumentId,
+                erpConfigId,
+
         sapPhioId: mapped.sapPhioId,
         sourceType: DOCUMENT_SOURCE_TYPE.SAP_SYNC,
         sapSyncStatus: hierarchy.resolved
@@ -216,8 +218,8 @@ async function upsertDocumentRecord(tenantId, mapped, masterCache) {
 /**
  * Runs the full DocumentMetaSet sync for one tenant.
  */
-async function syncDocuments({ tenantId, sapSyncLogId }) {
-  const erpConfig = await getSapErpConfigForTenant(tenantId);
+async function syncDocuments({ tenantId, sapSyncLogId, erpConfigId }) {
+  const erpConfig = await getSapErpConfigForTenant(tenantId, erpConfigId);
 
   // Ask SAP to filter server-side; still re-check client-side below in
   // case the target gateway ignores/partially supports $filter.
@@ -267,7 +269,12 @@ async function syncDocuments({ tenantId, sapSyncLogId }) {
     }
 
     try {
-      const result = await upsertDocumentRecord(tenantId, mapped, masterCache);
+      const result = await upsertDocumentRecord(
+  tenantId,
+  mapped,
+  masterCache,
+  erpConfig.id
+);
       if (result.action === "created") counters.created += 1;
       else counters.updated += 1;
       if (!result.resolved) counters.pendingClassification += 1;
@@ -289,6 +296,7 @@ async function syncDocuments({ tenantId, sapSyncLogId }) {
       errors.push({ entityType: "DOCUMENT", code: mapped.sapDocumentId, message: error.message, timestamp: new Date() });
       await RetryQueueService.enqueue({
         tenantId,
+        erpConfigId: erpConfig.id, // MULTI-ERP FIX
         entityType: SAP_SYNC_ENTITY_TYPE.DOCUMENT,
         referenceCode: mapped.sapDocumentId,
         payload: mapped,
@@ -307,6 +315,10 @@ async function syncDocuments({ tenantId, sapSyncLogId }) {
     recordsSkipped: counters.ignoredNoOriginal,
     summary: { DOCUMENT: counters, HIERARCHY: hierarchyCounters },
     errors,
+    // Same purpose as sapMasterSyncService's syncMasters() — lets the
+    // orchestrator stamp the SapSyncLog row with whichever ErpConfig
+    // actually drove this run.
+    erpConfigId: erpConfig.id,
   };
 }
 
@@ -317,8 +329,12 @@ async function syncDocuments({ tenantId, sapSyncLogId }) {
  * shape — so upsertDocumentRecord loads its own master-data cache when
  * called this way (see its doc comment).
  */
-async function retryDocumentRecord(tenantId, mapped) {
-  await upsertDocumentRecord(tenantId, mapped);
+// MULTI-ERP FIX: erpConfigId (taken from the Retry Queue row) makes the
+// retry resolve THAT ERP's config. Previously it called
+// getSapErpConfigForTenant(tenantId) with no ERP, which throws for
+// tenants with 2+ active SAP ERPs.
+async function retryDocumentRecord(tenantId, mapped, erpConfigId) {
+  await upsertDocumentRecord(tenantId, mapped, undefined, erpConfigId);
 }
 
 module.exports = {

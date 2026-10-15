@@ -24,6 +24,21 @@ module.exports = (sequelize) => sequelize.define(
       type: DataTypes.INTEGER,
       allowNull: false,
     },
+    // MULTI-ERP FIX (see migration 20260924000001-add-erpconfigid-to-retry-queue.js):
+    // which of the tenant's (possibly several) active SAP ERP connections
+    // produced this failure. Nullable so pre-existing rows created before
+    // this column existed keep working unmodified — they're simply not
+    // tied to a specific ERP and are only picked up when a retry is run
+    // WITHOUT an erpConfigId filter (the old, tenant-wide behavior).
+    //
+    // Retrying a specific ERP (POST /sap-sync/retry { erpConfigId }) must
+    // only ever re-attempt rows that failed against THAT ERP, using THAT
+    // ERP's own configuration — never a different ERP's, and never the
+    // tenant's default. See sapRetryQueueService.js / sapSyncOrchestrator.js.
+    erpConfigId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
     entityType: {
       type: DataTypes.ENUM("DEPARTMENT", "CATEGORY", "DOCUMENT_TYPE", "DOCUMENT"),
       allowNull: false,
@@ -86,9 +101,15 @@ module.exports = (sequelize) => sequelize.define(
     tableName: "sap_sync_retry_queue",
     timestamps: true,
     indexes: [
-      { fields: ["tenantId", "entityType", "referenceCode"], unique: true, name: "unique_retry_item_per_tenant" },
+      // MULTI-ERP FIX: erpConfigId joined the uniqueness key (see the
+      // migration for the matching addIndex/removeIndex on already-
+      // provisioned tenant databases) — a record with the same reference
+      // code failing against two different ERP connections is now two
+      // distinct queue rows instead of one row that only remembers the
+      // most recent ERP's error.
+      { fields: ["tenantId", "erpConfigId", "entityType", "referenceCode"], unique: true, name: "unique_retry_item_per_tenant_erp" },
       { fields: ["status", "nextRetryAt"] },
+      { fields: ["tenantId", "erpConfigId"] },
     ],
   }
 );
-

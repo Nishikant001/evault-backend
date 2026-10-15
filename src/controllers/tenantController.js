@@ -14,7 +14,15 @@
 // rather than standing up a parallel "/api/super-admin/tenants" prefix,
 // per the brief's own "do not create duplicate APIs" instruction.
 
-const { Tenant, TenantDatabase, TenantErpConnection, ErpConfig, masterSequelize } = require("../models/masterDb");
+const {
+  Tenant,
+  TenantDatabase,
+  TenantErpConnection,
+  ErpConfig,
+  masterSequelize,
+} = require("../models/masterDb");
+
+const { QueryTypes, Op } = require("sequelize");
 const { DEFAULT_HIERARCHY } = require("../constants/tenantMetadataDefaults");
 const {
   provisionTenant,
@@ -156,7 +164,15 @@ class TenantController {
           throw new Error("One or more ERP configurations were not found");
         }
         await TenantErpConnection.bulkCreate(
-          requestedErpIds.map((id) => ({ tenantId: tenant.id, erpConfigId: id, isActive: true })),
+          // PHASE 3 (multi-ERP sync management) — first selected
+          // connection becomes the default on creation, matching the
+          // legacy erpConfigId field set just below.
+          requestedErpIds.map((id, index) => ({
+            tenantId: tenant.id,
+            erpConfigId: id,
+            isActive: true,
+            isDefault: index === 0,
+          })),
           { transaction: t }
         );
         // Keep the legacy field populated with the first selected connection for
@@ -214,72 +230,136 @@ class TenantController {
 
   // GET /api/tenants — SuperAdmin only.
     // GET /api/tenants — SuperAdmin only.
-  static async getAll(req, res) {
-    try {
-      const { ErpConfig } = require("../models/masterDb");
+ // GET /api/tenants — SuperAdmin only.
+static async getAll(req, res) {
+  try {
+    const { ErpConfig } = require("../models/masterDb");
 
-      const tenants = await Tenant.findAll({
-        where: { status: "ACTIVE" },
-        include: [
-          {
-            model: TenantDatabase,
-            attributes: [
-              "databaseName",
-              "status",
-              "provisionedAt",
-              "documentCount",
-              "userCount",
-              "databaseDataBytes",
-              "databaseIndexBytes",
-              "databaseBytes",
-              "fileBytes",
-              "totalBytes",
-              "databaseQuotaBytes",
-              "fileQuotaBytes",
-              "storageMeasuredAt",
-              "provisioningAttempts",
-              "failedStep",
-              "lastErrorCode",
-              "failedAt",
-            ],
-          },
-          {
-            model: ErpConfig,
-            attributes: ["id", "name", "erpType", "baseUrl", "status", "integrationMode"],
-          },
-          {
-            model: TenantErpConnection,
-            as: "erpConnections",
-            where: { isActive: true },
-            required: false,
-            include: [{ model: ErpConfig, as: "erpConfig", attributes: ["id", "name", "erpType", "baseUrl", "status", "integrationMode"] }],
-          },
-        ],
-      });
+    const tenants = await Tenant.findAll({
+      where: { status: "ACTIVE" },
+      include: [
+        {
+          model: TenantDatabase,
+          attributes: [
+            "databaseName",
+            "status",
+            "provisionedAt",
+            "documentCount",
+            "userCount",
+            "databaseDataBytes",
+            "databaseIndexBytes",
+            "databaseBytes",
+            "fileBytes",
+            "totalBytes",
+            "databaseQuotaBytes",
+            "fileQuotaBytes",
+            "storageMeasuredAt",
+            "provisioningAttempts",
+            "failedStep",
+            "lastErrorCode",
+            "failedAt",
+          ],
+        },
+        {
+          model: ErpConfig,
+          attributes: [
+            "id",
+            "name",
+            "erpType",
+            "baseUrl",
+            "status",
+            "integrationMode",
+          ],
+        },
+        {
+          model: TenantErpConnection,
+          as: "erpConnections",
+          where: { isActive: true },
+          required: false,
+          include: [
+            {
+              model: ErpConfig,
+              as: "erpConfig",
+              attributes: [
+                "id",
+                "name",
+                "erpType",
+                "baseUrl",
+                "status",
+                "integrationMode",
+              ],
+            },
+          ],
+        },
+      ],
+    });
 
-      // Frontend reads `erpConfig` (lowercase) + `userCount` off each
-      // tenant directly — map Sequelize's capitalized association
-      // names (`ErpConfig`, `TenantDatabase`) into that shape here,
-      // same convention getMyMetadata() already uses below.
-      const data = tenants.map((t) => {
+    // Live user count from each tenant's physical users table.
+    const data = await Promise.all(
+      tenants.map(async (t) => {
         const json = t.toJSON();
+
+        let userCount = 0;
+        const databaseName = json.TenantDatabase?.databaseName;
+
+        if (databaseName) {
+          try {
+            // databaseName comes from our own TenantDatabase table.
+            // Escape backticks before using it as an identifier.
+            const safeDatabaseName = String(databaseName).replace(/`/g, "``");
+
+            const [result] = await masterSequelize.query(
+              `SELECT COUNT(*) AS userCount
+               FROM \`${safeDatabaseName}\`.\`users\``,
+              {
+                type: QueryTypes.SELECT,
+              }
+            );
+
+            userCount = Number(result?.userCount || 0);
+          } catch (countError) {
+            console.error(
+              `Failed to get live user count for tenant ${t.id}:`,
+              countError.message
+            );
+
+            // Fallback to persisted count if live count fails.
+            userCount = Number(json.TenantDatabase?.userCount || 0);
+          }
+        }
+
         return {
           ...json,
+
           erpConfig: json.ErpConfig || null,
+
           erpConnections: (json.erpConnections || []).map((c) => ({
             id: c.id,
             erpConfigId: c.erpConfigId,
             erpConfig: c.erpConfig || null,
+            isActive: c.isActive,
+            isDefault: c.isDefault,
           })),
-          userCount: json.TenantDatabase?.userCount ?? null,
-        };
-      });
 
-      return res.json({ success: true, data });
-    } catch (error) {
-      return res.status(500).json({ success: false, message: error.message });
-    }
+          // LIVE count
+          userCount,
+        };
+      })
+    );
+
+    return res.json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("getAll tenants error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
   }
+}
 
   // GET /api/tenants/:id — SuperAdmin only. Single-tenant detail,
   // including full provisioning status (not just the summary getAll gives).
@@ -608,13 +688,41 @@ class TenantController {
       }, { transaction });
 
       if (erpEnabled !== undefined || hasMultiSelection) {
+        // PHASE 3 (multi-ERP sync management) — this destroy+recreate was
+        // already here (Phase 1/2); preserve isDefault across it instead
+        // of silently wiping every tenant's default back to none on the
+        // next unrelated tenant edit that happens to resubmit erpConfigIds.
+        const previousDefault = await TenantErpConnection.findOne({
+          where: { tenantId: tenant.id, isDefault: true },
+          transaction,
+        });
+        const previousDefaultErpConfigId = previousDefault?.erpConfigId ?? null;
+
         const ids = nextErpEnabled && requestedErpIds ? requestedErpIds : [];
         await TenantErpConnection.destroy({ where: { tenantId: tenant.id }, transaction });
         if (ids.length) {
           await TenantErpConnection.bulkCreate(
-            ids.map((id) => ({ tenantId: tenant.id, erpConfigId: id, isActive: true })),
+            ids.map((id) => ({ tenantId: tenant.id, erpConfigId: id, isActive: true, isDefault: false })),
             { transaction }
           );
+          // Tenant-wide default: preserve the previous default when it is
+          // still assigned; otherwise default the first assigned connection.
+          // The default is ERP-type agnostic at the tenant-management level.
+          const restoredDefaultId = ids.includes(previousDefaultErpConfigId)
+            ? previousDefaultErpConfigId
+            : ids[0];
+          if (restoredDefaultId) {
+            await TenantErpConnection.update(
+              { isDefault: true },
+              { where: { tenantId: tenant.id, erpConfigId: restoredDefaultId }, transaction },
+            );
+            // MULTI-ERP FIX: the legacy Tenant.erpConfigId (shown in the
+            // Super Admin list/drawer and used as a fallback by older
+            // code) used to be set to requestedErpIds[0] — the FIRST ticked
+            // ERP — which is unrelated to the real default. Keep it equal
+            // to the default connection so both always agree.
+            await tenant.update({ erpConfigId: restoredDefaultId }, { transaction });
+          }
         }
       }
 
@@ -639,6 +747,76 @@ class TenantController {
   // INACTIVE tenant is correctly refused at login by
   // tenantResolverMiddleware.js regardless of whether its connection gets
   // proactively closed here or just naturally idles out.
+  // PUT /api/tenants/:id/erp-connections/:erpConfigId/default — SuperAdmin
+  // only. PHASE 3 (multi-ERP sync management), PART 2 — makes exactly one
+  // of a tenant's ACTIVE connections the default; unsets any previous
+  // default transactionally so two connections are never both default.
+  static async setDefaultErpConnection(req, res) {
+    try {
+      const tenantId = parseInt(req.params.id, 10);
+      const erpConfigId = parseInt(req.params.erpConfigId, 10);
+      if (!Number.isInteger(tenantId) || !Number.isInteger(erpConfigId)) {
+        return res.status(400).json({ success: false, message: "Invalid tenant or ERP configuration id" });
+      }
+
+      const transaction = await masterSequelize.transaction();
+      try {
+        // Ownership check first — an inactive or unassigned connection
+        // can never become default (PART 14: inactive ERPs are excluded
+        // from default selection).
+        const connection = await TenantErpConnection.findOne({
+          where: { tenantId, erpConfigId, isActive: true },
+          include: [{
+            model: ErpConfig,
+            as: "erpConfig",
+            attributes: ["id", "erpType", "status"],
+          }],
+          transaction,
+        });
+        if (!connection) {
+          await transaction.rollback();
+          return res.status(404).json({
+            success: false,
+            message: "This ERP configuration is not an active connection for this tenant",
+          });
+        }
+
+        if (!["ACTIVE", "CONNECTED"].includes(connection.erpConfig?.status)) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message: "Only an active ERP connection can be set as the tenant default",
+          });
+        }
+
+        await TenantErpConnection.update(
+          { isDefault: false },
+          { where: { tenantId, isDefault: true }, transaction },
+        );
+        await connection.update({ isDefault: true }, { transaction });
+
+        // MULTI-ERP FIX: keep legacy Tenant.erpConfigId in sync with the
+        // default, otherwise the tenant list/drawer keep showing the old
+        // ERP after "Set Default".
+        await Tenant.update(
+          { erpConfigId },
+          { where: { id: tenantId }, transaction },
+        );
+
+        await transaction.commit();
+        return res.json({
+          success: true,
+          data: { tenantId, erpConfigId, isDefault: true },
+        });
+      } catch (transactionError) {
+        await transaction.rollback().catch(() => {});
+        return res.status(500).json({ success: false, message: transactionError.message });
+      }
+    } catch (error) {
+      return res.status(500).json({ success: false, message: error.message });
+    }
+  }
+
   static async delete(req, res) {
     try {
       const tenant = await Tenant.findByPk(req.params.id);

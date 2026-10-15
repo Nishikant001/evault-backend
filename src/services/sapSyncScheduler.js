@@ -50,10 +50,53 @@ async function getSyncableTenants() {
   });
 }
 
-async function runJobFor(tenantId, jobName, triggerType, triggeredBy) {
-  if (jobName === "MASTER_SYNC") return Orchestrator.runMasterSync({ tenantId, triggerType, triggeredBy });
-  if (jobName === "DOCUMENT_SYNC") return Orchestrator.runDocumentSync({ tenantId, triggerType, triggeredBy });
-  if (jobName === "RETRY_SYNC") return Orchestrator.runRetry({ tenantId, triggerType, triggeredBy });
+// ============================================================
+// MULTI-ERP FIX
+// ============================================================
+//
+// Before this fix, every scheduled job (MASTER_SYNC / DOCUMENT_SYNC /
+// RETRY_SYNC) called the orchestrator with NO erpConfigId at all. That
+// is fine for a tenant with exactly one active SAP ERP connection (the
+// orchestrator falls back to it automatically) — but
+// sapMasterSyncService.getSapErpConfigForTenant() explicitly THROWS
+// ("Tenant has multiple active SAP ERP connections; please specify
+// erpConfigId") the moment a tenant has more than one. In practice this
+// meant scheduled sync was completely broken for any multi-ERP tenant —
+// every cron tick failed.
+//
+// getActiveSapErpConnections() below mirrors
+// sapSyncController.getActiveSapConnectionsForTenant() (same active +
+// erpType=SAP filter), and runScheduledJob() now runs the job once per
+// active SAP ERP connection, exactly like the existing
+// "Sync All ERPs" manual endpoint already does — one ERP failing never
+// stops the others, and the aggregate result/status reflects all of
+// them.
+//
+// A tenant with zero active SAP connections (not SAP-enabled, or
+// between ERP assignments) is left untouched — nothing to run, same as
+// before.
+
+async function getActiveSapErpConnections(tenantId) {
+  const { TenantErpConnection, ErpConfig } = masterModels;
+  return TenantErpConnection.findAll({
+    where: { tenantId, isActive: true },
+    include: [
+      {
+        model: ErpConfig,
+        as: "erpConfig",
+        where: { erpType: "SAP", status: { [require("sequelize").Op.in]: ["ACTIVE", "CONNECTED"] } },
+        required: true,
+        attributes: ["id", "name", "erpType", "status"],
+      },
+    ],
+    order: [["createdAt", "ASC"]],
+  });
+}
+
+async function runJobFor(tenantId, jobName, triggerType, triggeredBy, erpConfigId) {
+  if (jobName === "MASTER_SYNC") return Orchestrator.runMasterSync({ tenantId, triggerType, triggeredBy, erpConfigId });
+  if (jobName === "DOCUMENT_SYNC") return Orchestrator.runDocumentSync({ tenantId, triggerType, triggeredBy, erpConfigId });
+  if (jobName === "RETRY_SYNC") return Orchestrator.runRetry({ tenantId, triggerType, triggeredBy, erpConfigId });
   throw new Error(`Unknown job: ${jobName}`);
 }
 
@@ -67,13 +110,97 @@ function deriveStatus(result) {
   return "SUCCESS";
 }
 
+/**
+ * Runs one job for a tenant against EVERY active SAP ERP connection it
+ * has, sequentially (never in parallel — withTenantLock() in the
+ * orchestrator would reject overlapping runs for the same tenant
+ * anyway). One ERP's failure is caught and recorded, and does NOT stop
+ * the remaining ERPs from running.
+ *
+ * Returns a result shaped like a single orchestrator result (so the
+ * existing schedule-row update / audit code below doesn't need to
+ * change), aggregated across every ERP that ran:
+ *   - recordsCreated/recordsUpdated/recordsFailed are summed
+ *   - logId is the LAST successful run's log id (Job History / Log
+ *     Viewer can be filtered by erpConfigId to see any individual ERP's
+ *     own log row — see getSyncLogs's erpConfigId filter)
+ *   - perErp carries the individual per-connection outcome, exactly
+ *     like syncAllByType's response shape in sapSyncController.js, for
+ *     any caller that wants the detail instead of just the aggregate.
+ *
+ * Falls back to the pre-fix single unscoped call when the tenant has
+ * no rows in tenant_erp_connections yet (shouldn't happen post
+ * TENANT_MULTI_ERP_CONNECTIONS.md backfill, but keeps this safe for an
+ * environment where that migration hasn't run).
+ */
+async function runScheduledJob(tenantId, jobName, triggerType, triggeredBy) {
+  let connections = [];
+  try {
+    connections = await getActiveSapErpConnections(tenantId);
+  } catch (error) {
+    console.error(`⚠️  [SAP Sync] Could not resolve ERP connections for tenant ${tenantId}, falling back to legacy single-ERP call:`, error.message);
+  }
+
+  if (connections.length === 0) {
+    // No tenant_erp_connections rows (legacy/unmigrated) — behave exactly
+    // as before this fix, letting the orchestrator resolve tenant.ErpConfig.
+    return runJobFor(tenantId, jobName, triggerType, triggeredBy, undefined);
+  }
+
+  if (connections.length === 1) {
+    // Exactly one active SAP ERP — same effective behavior as before,
+    // just passed explicitly instead of relying on fallback resolution.
+    return runJobFor(tenantId, jobName, triggerType, triggeredBy, connections[0].erpConfigId);
+  }
+
+  const perErp = [];
+  let lastLogId = null;
+
+  for (const connection of connections) {
+    const erpConfigId = connection.erpConfigId;
+    const erpName = connection.erpConfig?.name || `ERP #${erpConfigId}`;
+
+    try {
+      const result = await runJobFor(tenantId, jobName, triggerType, triggeredBy, erpConfigId);
+      lastLogId = result?.logId ?? lastLogId;
+      perErp.push({ erpConfigId, erpName, status: "COMPLETED", result });
+    } catch (error) {
+      console.error(`❌ [SAP Sync] ${jobName} failed for tenant ${tenantId}, ERP ${erpConfigId} (${erpName}):`, error.message);
+      perErp.push({ erpConfigId, erpName, status: "FAILED", error: error.message });
+    }
+  }
+
+  const aggregate = perErp.reduce(
+    (acc, item) => {
+      if (item.status === "FAILED") {
+        acc.recordsFailed += 1;
+      } else {
+        acc.recordsCreated += item.result?.recordsCreated || 0;
+        acc.recordsUpdated += item.result?.recordsUpdated || 0;
+        acc.recordsFailed += item.result?.recordsFailed || 0;
+      }
+      return acc;
+    },
+    { recordsCreated: 0, recordsUpdated: 0, recordsFailed: 0 },
+  );
+
+  return {
+    logId: lastLogId,
+    totalErps: perErp.length,
+    completed: perErp.filter((item) => item.status === "COMPLETED").length,
+    failed: perErp.filter((item) => item.status === "FAILED").length,
+    perErp,
+    ...aggregate,
+  };
+}
+
 /** Executes a job immediately (Run Now button) and records the outcome on the schedule row, in that tenant's OWN database. */
 async function runJobNow(tenantId, jobName, triggeredBy) {
   const { models } = await getTenantConnection(tenantId);
   const schedule = await models.SapSyncSchedule.findOne({ where: { jobName } });
   const start = Date.now();
   try {
-    const result = await runJobFor(tenantId, jobName, SAP_SYNC_TRIGGER.MANUAL, triggeredBy);
+    const result = await runScheduledJob(tenantId, jobName, SAP_SYNC_TRIGGER.MANUAL, triggeredBy);
     if (schedule) {
       await schedule.update({
         lastRunAt: new Date(),
@@ -107,7 +234,7 @@ async function registerTask(tenantId, scheduleRow) {
   const task = cron.schedule(scheduleRow.cronExpression, async () => {
     const start = Date.now();
     try {
-      const result = await runJobFor(tenantId, scheduleRow.jobName, SAP_SYNC_TRIGGER.SCHEDULED, null);
+      const result = await runScheduledJob(tenantId, scheduleRow.jobName, SAP_SYNC_TRIGGER.SCHEDULED, null);
       const { models } = await getTenantConnection(tenantId);
       await models.SapSyncSchedule.update(
         {
@@ -178,5 +305,6 @@ module.exports = {
   stop,
   reload,
   runJobNow,
+  runScheduledJob,
   getSyncableTenants,
 };

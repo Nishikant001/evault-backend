@@ -104,8 +104,10 @@ function validateFieldValue(field, value, allValues = {}) {
     }
 
     case FIELD_TYPES.DATE: {
+      // Date.parse() rejects common day-first input such as "18-09-2026";
+      // accept it (explicit day-first parse) in addition to what Date.parse allows.
       const parsed = Date.parse(strValue);
-      if (Number.isNaN(parsed)) {
+      if (Number.isNaN(parsed) && !require("./ocr/normalizers").parseDate(strValue).ok) {
         errors.push(`${field.label} must be a valid date`);
       }
       break;

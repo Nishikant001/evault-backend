@@ -43,32 +43,142 @@ function getModels(req) {
 
 function getCurrentUserId(req) {
   const userId =
-    req.user?.id ||
-    req.auth?.userId ||
+    req.user?.id ??
+    req.auth?.userId ??
+    req.auth?.id ??
     req.userId;
 
   if (!userId) {
-    throw new Error(
+    const error = new Error(
       "Authenticated user not found"
     );
+
+    error.statusCode = 401;
+    throw error;
   }
 
-  return Number(userId);
+  const numericUserId = Number(userId);
+
+  if (!Number.isInteger(numericUserId) || numericUserId <= 0) {
+    const error = new Error(
+      "Invalid authenticated user ID"
+    );
+
+    error.statusCode = 401;
+    throw error;
+  }
+
+  return numericUserId;
 }
 
 function getTenantId(req) {
   const tenantId =
-    req.tenant?.id ||
-    req.tenantId ||
-    req.user?.tenantId;
+    req.tenant?.id ??
+    req.tenantId ??
+    req.user?.tenantId ??
+    req.auth?.tenantId;
 
   if (!tenantId) {
-    throw new Error(
+    const error = new Error(
       "Tenant context not found"
     );
+
+    error.statusCode = 401;
+    throw error;
   }
 
-  return Number(tenantId);
+  const numericTenantId = Number(tenantId);
+
+  if (
+    !Number.isInteger(numericTenantId) ||
+    numericTenantId <= 0
+  ) {
+    const error = new Error(
+      "Invalid tenant context"
+    );
+
+    error.statusCode = 401;
+    throw error;
+  }
+
+  return numericTenantId;
+}
+
+// ============================================================
+// RESOLVE REQUESTER DEPARTMENT
+// ============================================================
+//
+// requesterDepartmentId must NEVER come from the frontend.
+// It is resolved from the authenticated user's active
+// UserAssignment.
+//
+// UserAssignment.departmentId is already populated for:
+//   DEPARTMENT
+//   CATEGORY
+//   DOCUMENT_TYPE
+//
+// This also supports OLD requests where requesterDepartmentId
+// was saved as NULL.
+// ============================================================
+
+async function resolveRequesterDepartmentId(
+  req,
+  tenantId,
+  userId,
+  existingDepartmentId = null
+) {
+  const existingId = Number(existingDepartmentId);
+
+  // Existing request already has department ID.
+  if (
+    Number.isInteger(existingId) &&
+    existingId > 0
+  ) {
+    return existingId;
+  }
+
+  const {
+    UserAssignment,
+  } = getModels(req);
+
+  if (!UserAssignment) {
+    return null;
+  }
+
+  const assignment =
+    await UserAssignment.findOne({
+      where: {
+        tenantId,
+        userId,
+        status: "ACTIVE",
+        departmentId: {
+          [Op.ne]: null,
+        },
+      },
+      attributes: [
+        "id",
+        "userId",
+        "departmentId",
+        "assignmentLevel",
+        "createdAt",
+      ],
+      order: [
+        ["createdAt", "ASC"],
+      ],
+      raw: true,
+    });
+
+  const departmentId =
+    Number(assignment?.departmentId);
+
+  if (
+    Number.isInteger(departmentId) &&
+    departmentId > 0
+  ) {
+    return departmentId;
+  }
+
+  return null;
 }
 async function assertDepartmentAccess(req, departmentId) {
   const tenantId = getTenantId(req);
@@ -252,6 +362,10 @@ async function getRequestById(
 // CREATE REQUEST
 // ============================================================
 
+// ============================================================
+// CREATE REQUEST
+// ============================================================
+
 async function createRequest(
   req,
   payload
@@ -292,12 +406,18 @@ async function createRequest(
     );
   }
 
+  // ==========================================================
+  // IMPORTANT:
+  // Never trust requesterDepartmentId from frontend.
+  // Resolve it from the authenticated user's assignment.
+  // ==========================================================
+
   const requesterDepartmentId =
-    payload.requesterDepartmentId
-      ? Number(
-          payload.requesterDepartmentId
-        )
-      : null;
+    await resolveRequesterDepartmentId(
+      req,
+      tenantId,
+      requesterUserId
+    );
 
   const request =
     await DocumentAccessRequest.create({
@@ -320,7 +440,9 @@ async function createRequest(
 
       reason:
         payload.reason
-          ? String(payload.reason).trim()
+          ? String(
+              payload.reason
+            ).trim()
           : null,
 
       sourceDocumentId: null,
@@ -333,6 +455,10 @@ async function createRequest(
   return request;
 }
 
+
+// ============================================================
+// LIST REQUESTS
+// ============================================================
 
 // ============================================================
 // LIST REQUESTS
@@ -364,10 +490,24 @@ async function listRequests(
       filters.status;
   }
 
-  if (filters.scope === "mine") {
+  // ==========================================================
+  // MY REQUESTS
+  // ==========================================================
+
+  if (
+    filters.scope === "mine"
+  ) {
     where.requesterUserId =
       userId;
-  } else if (filters.scope === "manage") {
+  }
+
+  // ==========================================================
+  // MANAGE REQUESTS
+  // ==========================================================
+
+  else if (
+    filters.scope === "manage"
+  ) {
     const scope =
       await resolveScope(
         getModels(req),
@@ -377,16 +517,28 @@ async function listRequests(
       );
 
     if (scope !== null) {
-      if (!scope.departmentIds.length) {
+      if (
+        !scope.departmentIds.length
+      ) {
         return [];
       }
 
       where.requestedDepartmentId = {
-        [Op.in]: scope.departmentIds,
+        [Op.in]:
+          scope.departmentIds,
       };
     }
-    // scope === null → unrestricted role (SuperAdmin/TenantAdmin) → sees all
-  } else if (
+
+    // scope === null
+    // means SuperAdmin/TenantAdmin
+    // and therefore unrestricted.
+  }
+
+  // ==========================================================
+  // SPECIFIC REQUESTED DEPARTMENT
+  // ==========================================================
+
+  else if (
     filters.requestedDepartmentId
   ) {
     where.requestedDepartmentId =
@@ -395,63 +547,435 @@ async function listRequests(
       );
   }
 
-    const rows = await DocumentAccessRequest.findAll({
-    where,
+  // ==========================================================
+  // LOAD REQUESTS
+  // ==========================================================
 
-    order: [
-      [
-        "createdAt",
-        "DESC",
+  const rows =
+    await DocumentAccessRequest.findAll({
+      where,
+
+      order: [
+        [
+          "createdAt",
+          "DESC",
+        ],
       ],
-    ],
-  });
+    });
 
   if (!rows.length) {
     return rows;
   }
 
-  // Attach the linked temporary share's id/status/expiry (if any) onto
-  // each request, so the frontend can build View/Download links for
-  // "Shared With Me" without needing a separate share-listing endpoint.
-  const { CrossDepartmentDocumentShare } = getModels(req);
+  // ==========================================================
+  // LOAD TEMPORARY SHARES
+  // ==========================================================
 
-    const shares = await CrossDepartmentDocumentShare.findAll({
-    where: {
-      tenantId,
-      requestId: {
-        [Op.in]: rows.map((row) => row.id),
-      },
-      // Sirf wo shares jo owner ne actually SEND kiye hain, unhi ko
-      // recipient ke "Shared With Me" mein dikhao. Ek request ke
-      // against multiple PREPARED-but-never-sent retries ho sakti
-      // hain (mask error, dobara prepare, etc.) — un stale/abandoned
-      // rows ko recipient ko kabhi dikhana hi nahi chahiye.
-      sentAt: {
-        [Op.ne]: null,
-      },
-    },
-    order: [["sentAt", "DESC"]],
-  });
+  const {
+    CrossDepartmentDocumentShare,
+  } = getModels(req);
 
-  const latestShareByRequestId = new Map();
-  for (const share of shares) {
-    if (!latestShareByRequestId.has(share.requestId)) {
-      latestShareByRequestId.set(share.requestId, share);
+  const shares =
+    await CrossDepartmentDocumentShare.findAll({
+      where: {
+        tenantId,
+
+        requestId: {
+          [Op.in]:
+            rows.map(
+              (row) => row.id
+            ),
+        },
+
+        // Only actually SENT shares should appear
+        // in Shared With Me.
+        sentAt: {
+          [Op.ne]: null,
+        },
+      },
+
+      order: [
+        ["sentAt", "DESC"],
+      ],
+    });
+
+  const latestShareByRequestId =
+    new Map();
+
+  for (
+    const share of shares
+  ) {
+    if (
+      !latestShareByRequestId.has(
+        share.requestId
+      )
+    ) {
+      latestShareByRequestId.set(
+        share.requestId,
+        share
+      );
     }
   }
 
-  return rows.map((row) => {
-    const plain = row.toJSON();
-    const share = latestShareByRequestId.get(row.id);
+  // ==========================================================
+  // REQUESTER USER IDs
+  // ==========================================================
 
-    if (share) {
-      plain.shareId = share.id;
-      plain.shareStatus = share.status;
-      plain.shareExpiresAt = share.expiresAt;
+  const requesterUserIds = [
+    ...new Set(
+      rows
+        .map(
+          (row) =>
+            Number(
+              row.requesterUserId
+            )
+        )
+        .filter(
+          (id) =>
+            Number.isInteger(id) &&
+            id > 0
+        )
+    ),
+  ];
+
+  // ==========================================================
+  // RESOLVE MISSING REQUESTER DEPARTMENTS
+  // ==========================================================
+  //
+  // IMPORTANT:
+  // Old requests may have requesterDepartmentId = NULL.
+  // Resolve those from UserAssignment.
+  //
+  // This fixes OLD requests without requiring a DB migration
+  // or manual SQL update.
+  // ==========================================================
+
+  const existingRequesterDepartmentByUserId =
+    new Map();
+
+  for (
+    const row of rows
+  ) {
+    const requesterId =
+      Number(
+        row.requesterUserId
+      );
+
+    const departmentId =
+      Number(
+        row.requesterDepartmentId
+      );
+
+    if (
+      Number.isInteger(
+        requesterId
+      ) &&
+      requesterId > 0 &&
+      Number.isInteger(
+        departmentId
+      ) &&
+      departmentId > 0
+    ) {
+      existingRequesterDepartmentByUserId.set(
+        requesterId,
+        departmentId
+      );
     }
+  }
 
-    return plain;
-  });
+  const requesterDepartmentByUserId =
+    new Map();
+
+  for (
+    const userIdValue of requesterUserIds
+  ) {
+    const existingDepartmentId =
+      existingRequesterDepartmentByUserId.get(
+        userIdValue
+      );
+
+    const resolvedDepartmentId =
+      await resolveRequesterDepartmentId(
+        req,
+        tenantId,
+        userIdValue,
+        existingDepartmentId
+      );
+
+    if (
+      Number.isInteger(
+        Number(
+          resolvedDepartmentId
+        )
+      ) &&
+      Number(
+        resolvedDepartmentId
+      ) > 0
+    ) {
+      requesterDepartmentByUserId.set(
+        userIdValue,
+        Number(
+          resolvedDepartmentId
+        )
+      );
+    }
+  }
+
+  // ==========================================================
+  // ALL DEPARTMENT IDS
+  // ==========================================================
+
+  const departmentIds = [
+    ...new Set(
+      [
+        ...rows.map(
+          (row) =>
+            row.requestedDepartmentId
+        ),
+
+        ...rows.map(
+          (row) =>
+            requesterDepartmentByUserId.get(
+              Number(
+                row.requesterUserId
+              )
+            )
+        ),
+      ]
+        .map(Number)
+        .filter(
+          (id) =>
+            Number.isInteger(id) &&
+            id > 0
+        )
+    ),
+  ];
+
+  // ==========================================================
+  // LOAD REQUESTER USERS
+  // ==========================================================
+
+  const requesterById =
+    new Map();
+
+  const {
+    User,
+  } = getModels(req);
+
+  if (
+    requesterUserIds.length &&
+    User
+  ) {
+    const users =
+      await User.findAll({
+        where: {
+          id: {
+            [Op.in]:
+              requesterUserIds,
+          },
+        },
+
+        attributes: [
+          "id",
+          "name",
+          "email",
+        ],
+
+        raw: true,
+      });
+
+    for (
+      const user of users
+    ) {
+      requesterById.set(
+        Number(user.id),
+        user
+      );
+    }
+  }
+
+  // ==========================================================
+  // LOAD DEPARTMENTS FROM MASTER DB
+  // ==========================================================
+
+  const departmentById =
+    new Map();
+
+  if (
+    departmentIds.length &&
+    req.masterModels?.Department
+  ) {
+    const departments =
+      await req.masterModels.Department.findAll({
+        where: {
+          id: {
+            [Op.in]:
+              departmentIds,
+          },
+        },
+
+        attributes: [
+          "id",
+          "name",
+          "code",
+        ],
+
+        raw: true,
+      });
+
+    for (
+      const department of departments
+    ) {
+      departmentById.set(
+        Number(
+          department.id
+        ),
+        department
+      );
+    }
+  }
+
+  // ==========================================================
+  // BUILD FINAL RESPONSE
+  // ==========================================================
+
+  return rows.map(
+    (row) => {
+      const plain =
+        row.toJSON();
+
+      // ------------------------------------------------------
+      // REQUESTER
+      // ------------------------------------------------------
+
+      const requester =
+        requesterById.get(
+          Number(
+            plain.requesterUserId
+          )
+        );
+
+      if (requester) {
+        plain.requester =
+          requester;
+
+        plain.requesterName =
+          requester.name;
+
+        plain.requesterEmail =
+          requester.email;
+      } else {
+        plain.requester =
+          null;
+
+        plain.requesterName =
+          null;
+
+        plain.requesterEmail =
+          null;
+      }
+
+      // ------------------------------------------------------
+      // REQUESTER DEPARTMENT
+      // ------------------------------------------------------
+
+      const resolvedRequesterDepartmentId =
+        requesterDepartmentByUserId.get(
+          Number(
+            plain.requesterUserId
+          )
+        );
+
+      if (
+        Number.isInteger(
+          Number(
+            resolvedRequesterDepartmentId
+          )
+        ) &&
+        Number(
+          resolvedRequesterDepartmentId
+        ) > 0
+      ) {
+        const requesterDepartment =
+          departmentById.get(
+            Number(
+              resolvedRequesterDepartmentId
+            )
+          );
+
+        plain.requesterDepartmentId =
+          Number(
+            resolvedRequesterDepartmentId
+          );
+
+        plain.requesterDepartment =
+          requesterDepartment ||
+          null;
+
+        plain.requesterDepartmentName =
+          requesterDepartment?.name ||
+          null;
+
+        plain.requesterDepartmentCode =
+          requesterDepartment?.code ||
+          null;
+      } else {
+        plain.requesterDepartment =
+          null;
+
+        plain.requesterDepartmentName =
+          null;
+
+        plain.requesterDepartmentCode =
+          null;
+      }
+
+      // ------------------------------------------------------
+      // REQUESTED DEPARTMENT
+      // ------------------------------------------------------
+
+      const requestedDepartment =
+        departmentById.get(
+          Number(
+            plain.requestedDepartmentId
+          )
+        );
+
+      plain.requestedDepartment =
+        requestedDepartment ||
+        null;
+
+      plain.requestedDepartmentName =
+        requestedDepartment?.name ||
+        null;
+
+      plain.requestedDepartmentCode =
+        requestedDepartment?.code ||
+        null;
+
+      // ------------------------------------------------------
+      // SHARE DETAILS
+      // ------------------------------------------------------
+
+      const share =
+        latestShareByRequestId.get(
+          row.id
+        );
+
+      if (share) {
+        plain.shareId =
+          share.id;
+
+        plain.shareStatus =
+          share.status;
+
+        plain.shareExpiresAt =
+          share.expiresAt;
+      }
+
+      return plain;
+    }
+  );
 }
 
 
@@ -1070,15 +1594,28 @@ async function getAccessibleShare(
     throw error;
   }
 
-  assertSameTenant(
-    share,
-    tenantId
-  );
+  console.log(
+  "[CrossDepartmentShare] ACCESS CHECK",
+  {
+    shareId,
+    shareTenantId: Number(share.tenantId),
+    requestTenantId: Number(tenantId),
+    shareRecipientUserId: Number(share.recipientUserId),
+    currentUserId: Number(userId),
+    status: share.status,
+    expiresAt: share.expiresAt,
+  }
+);
 
-  assertRecipient(
-    share,
-    userId
-  );
+assertSameTenant(
+  share,
+  tenantId
+);
+
+assertRecipient(
+  share,
+  userId
+);
 
   if (
     share.status ===
@@ -1230,40 +1767,14 @@ async function ownerPreviewShare(req, shareId) {
 // DOWNLOAD
 // ============================================================
 
-async function downloadShare(
-  req,
-  shareId
-) {
-  const share =
-    await getAccessibleShare(
-      req,
-      shareId
-    );
+async function downloadShare(req, shareId) {
+  const error = new Error(
+    "Download is not permitted for temporarily shared documents."
+  );
 
-  // ── NEW: same fix as viewShare — return real bytes, not the record.
-  if (
-    !share.temporaryStorageKey ||
-    !fs.existsSync(share.temporaryStorageKey)
-  ) {
-    const error = new Error(
-      "Temporary shared document not found"
-    );
-    error.statusCode = 404;
-    throw error;
-  }
+  error.statusCode = 403;
 
-  const buffer = fs.readFileSync(share.temporaryStorageKey);
-
-  share.lastAccessedAt =
-    new Date();
-
-  await share.save();
-
-  return {
-    buffer,
-    mimeType: share.temporaryMimeType,
-    fileName: share.temporaryFileName,
-  };
+  throw error;
 }
 
 
@@ -1774,7 +2285,7 @@ module.exports = {
   getAccessibleShare,
   viewShare,
   ownerPreviewShare,
-  downloadShare,
+  // downloadShare,
   maskShare,
   revokeShare,
   expireShare,

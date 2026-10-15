@@ -14,7 +14,9 @@ const {
   testConnectionStream,
   discoverMetadata,
   validateMapping,
-  generateInboundCredentials
+  generateInboundCredentials,
+  getConnectorSchema,
+  validateConnector,
 } = require("../controllers/erpConfigController");
 
 // SuperAdmin only
@@ -30,6 +32,22 @@ router.get(
   auth,
   role("SuperAdmin"),
   listErpConfigs
+);
+
+// DYNAMIC ERP CONNECTOR (Step 1) — must stay ABOVE "/:id" or Express
+// would treat "connector-schema" as an id.
+router.get(
+  "/connector-schema",
+  auth,
+  role("SuperAdmin"),
+  getConnectorSchema
+);
+
+router.post(
+  "/validate-connector",
+  auth,
+  role("SuperAdmin"),
+  validateConnector
 );
 
 router.get(

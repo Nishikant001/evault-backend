@@ -32,8 +32,9 @@ async function loadAccessibleDocument(req) {
 async function loadFieldsForVersion(models, versionId) {
   if (!versionId) return [];
   const { MetadataField, OcrAlias } = models;
+  // ACTIVE only: identical to the set the OCR mapper maps, so Review/validation/save agree.
   return MetadataField.findAll({
-    where: { metadataTemplateVersionId: versionId },
+    where: { metadataTemplateVersionId: versionId, status: "ACTIVE" },
     include: [{ model: OcrAlias, as: "ocrAliases" }],
     order: [["displayOrder", "ASC"]],
   });
@@ -60,11 +61,25 @@ const getDocumentMetadata = async (req, res) => {
 
     const fields = await loadFieldsForVersion(req.models, record.metadataTemplateVersionId);
 
+    // The document stays bound to the template version it was mapped with. If a
+    // newer version has since been assigned to the document type, flag it (do not
+    // silently switch) so the UI can tell the user.
+    let templateVersionStale = false; let activeTemplateVersionId = null;
+    try {
+      const active = await require("../services/metadataTemplateService").resolveActiveVersionForDocumentType(req.models, req.user.tenantId, document.documentTypeId);
+      activeTemplateVersionId = active ? active.id : null;
+      templateVersionStale = !!active && active.id !== record.metadataTemplateVersionId;
+    } catch (_) { /* informational only */ }
+    const summary = (record.rawOcrJson && record.rawOcrJson.ocrSummary) || null;
+
     return res.json({
       success: true,
       data: {
         documentId: document.id,
         metadataTemplateVersionId: record.metadataTemplateVersionId,
+        activeTemplateVersionId,
+        templateVersionStale,
+        ocrEngine: summary ? { used: summary.engineUsed || null, requested: summary.engineRequested || null, fallbackUsed: !!summary.fallbackUsed, status: summary.status || null, providerError: summary.providerError || null, warnings: summary.warnings || [] } : null,
         rawOcr: record.rawOcrJson,
         mappedMetadata: record.mappedMetadataJson,
         confidence: record.confidenceJson,
@@ -101,6 +116,7 @@ const correctDocumentMetadata = async (req, res) => {
 
     const mergedMetadata = { ...(record.mappedMetadataJson || {}) };
     const history = Array.isArray(record.correctionHistory) ? [...record.correctionHistory] : [];
+    const confidenceJson = { ...(record.confidenceJson || {}) };
     const now = new Date();
 
     for (const [internalName, newValue] of Object.entries(values)) {
@@ -119,6 +135,8 @@ const correctDocumentMetadata = async (req, res) => {
         correctedAt: now,
       });
       mergedMetadata[internalName] = newValue;
+      // Provenance: keep the OCR evidence, mark the value as user-edited.
+      confidenceJson[internalName] = { ...(confidenceJson[internalName] || {}), status: "MANUALLY_EDITED", manuallyEdited: true, editedBy: req.user.id, editedAt: now };
     }
 
     // FORMULA fields are derived — recompute them from whatever values
@@ -149,6 +167,7 @@ const correctDocumentMetadata = async (req, res) => {
 
     await record.update({
       mappedMetadataJson: mergedMetadata,
+      confidenceJson,
       validationErrorsJson: errors,
       correctionHistory: history,
       status: confirm && Object.keys(errors).length === 0 ? "CONFIRMED" : record.status,

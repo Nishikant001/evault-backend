@@ -49,7 +49,10 @@ async function resolveScope(models, tenantId, userId, role) {
 
   const { Category, DocumentType } = models;
   const assignments = await getActiveAssignments(models, tenantId, userId);
-  if (!assignments.length) return null; // backward compatibility
+   // No active assignment => user can access NOTHING (not everything)
+  if (!assignments.length) {
+    return { departmentIds: [], categoryIds: [], documentTypeIds: [] };
+  }
 
   const departmentIds = new Set();
   const directCategoryIds = new Set();
@@ -93,6 +96,84 @@ async function resolveScope(models, tenantId, userId, role) {
   };
 }
 
+// ── Resolve which Plants / CompanyCodes a scoped user can see ──
+// Company Code and Plant sit ABOVE Department in the hierarchy, and
+// Department itself lives in the shared Master DB (not in `models`,
+// which is tenant-scoped), so resolveScope() above can't reach them
+// directly. This helper takes the department/category/documentType
+// scope resolveScope() already computed and walks it back UP to the
+// accessible Plant and CompanyCode ids, via each department's
+// TenantDepartmentPlant mapping (per-tenant).
+//
+// Pass it the SAME `scope` object resolveScope() returned.
+// Returns null when scope is null (unrestricted — caller should show
+// everything, same convention as resolveScope). Otherwise returns
+// { departmentIds, plantIds, companyCodeIds } — any of which may be an
+// EMPTY array, meaning "this user has nothing to see at this level".
+async function resolveLocationScope(models, tenantId, scope) {
+  if (!scope) return null;
+
+  const { Category, DocumentType, TenantDepartmentPlant, Plant } = models;
+
+  // Widen departmentIds to also cover CATEGORY/DOCUMENT_TYPE-level
+  // assignments — resolveScope() only populates departmentIds for
+  // DEPARTMENT-level rows, so a user assigned at Category or
+  // DocumentType level would otherwise look like they have zero
+  // accessible departments (and therefore zero plants/company codes),
+  // even though they can see documents under that category/doc-type fine.
+  const departmentIds = new Set(scope.departmentIds);
+
+  if (scope.categoryIds.length) {
+    const cats = await Category.findAll({
+      where: { tenantId, id: scope.categoryIds },
+      attributes: ["departmentId"],
+      raw: true,
+    });
+    cats.forEach((c) => c.departmentId && departmentIds.add(c.departmentId));
+  }
+
+  if (scope.documentTypeIds.length) {
+    const dts = await DocumentType.findAll({
+      where: { tenantId, id: scope.documentTypeIds },
+      attributes: ["categoryId"],
+      raw: true,
+    });
+    const catIdsFromDts = [...new Set(dts.map((d) => d.categoryId).filter(Boolean))];
+    if (catIdsFromDts.length) {
+      const catsFromDts = await Category.findAll({
+        where: { tenantId, id: catIdsFromDts },
+        attributes: ["departmentId"],
+        raw: true,
+      });
+      catsFromDts.forEach((c) => c.departmentId && departmentIds.add(c.departmentId));
+    }
+  }
+
+  const departmentIdList = Array.from(departmentIds);
+  if (!departmentIdList.length) {
+    return { departmentIds: [], plantIds: [], companyCodeIds: [] };
+  }
+
+  const mappings = await TenantDepartmentPlant.findAll({
+    where: { tenantId, departmentId: departmentIdList, status: "ACTIVE" },
+    attributes: ["plantId"],
+    raw: true,
+  });
+  const plantIds = [...new Set(mappings.map((m) => m.plantId))];
+  if (!plantIds.length) {
+    return { departmentIds: departmentIdList, plantIds: [], companyCodeIds: [] };
+  }
+
+  const plants = await Plant.findAll({
+    where: { tenantId, id: plantIds },
+    attributes: ["companyCodeId"],
+    raw: true,
+  });
+  const companyCodeIds = [...new Set(plants.map((p) => p.companyCodeId))];
+
+  return { departmentIds: departmentIdList, plantIds, companyCodeIds };
+}
+
 // ── Single-record access checks (used by middleware) ────────
 
 async function hasDepartmentAccess(models, tenantId, userId, role, departmentId) {
@@ -117,6 +198,7 @@ module.exports = {
   UNRESTRICTED_ROLES,
   getActiveAssignments,
   resolveScope,
+  resolveLocationScope,
   hasDepartmentAccess,
   hasCategoryAccess,
   hasDocumentTypeAccess,

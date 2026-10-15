@@ -84,7 +84,13 @@ class AuthController {
         });
         return res.status(401).json({ success: false, message: "Invalid Credentials" });
       }
-      const identity = { id: user.id, role: user.role, tenantId: indexEntry.tenantId, email: user.email };
+      const identity = {
+  id: user.id,
+  name: user.name,
+  role: user.role,
+  tenantId: indexEntry.tenantId,
+  email: user.email,
+};
       const accessToken = JwtService.generateAccessToken(identity);
       const refreshToken = JwtService.generateRefreshToken(identity);
       await conn.models.RefreshToken.create({

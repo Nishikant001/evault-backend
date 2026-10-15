@@ -8,12 +8,16 @@
 // in JS (see hydrateDepartments() below).
 const ErpFactory = require("../services/erpFactory");
 const SapService = require("../services/sapService");
-const processOCR = require("../workers/ocrWorker"); 
+const processOCR = require("../workers/ocrWorker");
 const { v4: uuidv4 } = require("uuid");
 const path = require("path");
 const fs = require("fs");
 const AuditService = require("../services/auditService");
-const { AUDIT_ACTIONS, AUDIT_MODULES, AUDIT_STATUS } = require("../constants/auditActions");
+const {
+  AUDIT_ACTIONS,
+  AUDIT_MODULES,
+  AUDIT_STATUS,
+} = require("../constants/auditActions");
 const ApprovalEngineService = require("../services/approvalEngineService");
 const SapFinalizationService = require("../services/sapFinalizationService");
 const CheckInOutService = require("../services/checkInOutService");
@@ -21,7 +25,9 @@ const userAssignmentService = require("../services/userAssignmentService");
 const documentSearchService = require("../services/documentSearchService");
 const { Op } = require("sequelize");
 // ── Subscription Management System ──────────────────────────
-const { finalizeDocumentLocally } = require("../services/localFinalizationService");
+const {
+  finalizeDocumentLocally,
+} = require("../services/localFinalizationService");
 const WatermarkService = require("../services/watermarkService");
 const ThumbnailService = require("../services/thumbnailService");
 const fsPromises = require("fs/promises");
@@ -75,7 +81,8 @@ async function hydrateDepartments(masterModels, docOrDocs) {
   });
   const byId = new Map(departments.map((d) => [d.id, d]));
   for (const d of list) {
-    if (d) d.Department = d.departmentId ? byId.get(d.departmentId) || null : null;
+    if (d)
+      d.Department = d.departmentId ? byId.get(d.departmentId) || null : null;
   }
   return docOrDocs;
 }
@@ -148,7 +155,10 @@ const uploadDocument = async (req, res) => {
     // Department is Master DB — resolved separately for the audit log
     // below (see hydrateDepartments() header comment).
     const uploadDepartment = docType.Category?.departmentId
-      ? await req.masterModels.Department.findByPk(docType.Category.departmentId, { attributes: ["id", "name"] })
+      ? await req.masterModels.Department.findByPk(
+          docType.Category.departmentId,
+          { attributes: ["id", "name"] },
+        )
       : null;
 
     // 3b. Dynamic User Assignment Engine: user must have DEPARTMENT,
@@ -158,7 +168,7 @@ const uploadDocument = async (req, res) => {
       tenantId,
       uploadedBy,
       req.user.role,
-      docType.id
+      docType.id,
     );
     if (!hasUploadAccess) {
       return res.status(403).json({
@@ -346,10 +356,13 @@ const listDocuments = async (req, res) => {
       req.models,
       tenantId,
       req.user.id,
-      req.user.role
+      req.user.role,
     );
     if (scope) {
-      if (documentTypeId && !scope.documentTypeIds.includes(Number(documentTypeId))) {
+      if (
+        documentTypeId &&
+        !scope.documentTypeIds.includes(Number(documentTypeId))
+      ) {
         return res.status(403).json({
           success: false,
           message: "You do not have access to this document type",
@@ -369,7 +382,7 @@ const listDocuments = async (req, res) => {
       include: [
         { model: Category, attributes: ["id", "name"] },
         { model: DocumentType, attributes: ["id", "name"] },
-        { model: User, as: "uploader", attributes: ["id", "email"] },
+        { model: User, as: "uploader", attributes: ["id", "name", "email"] },
       ],
       order: [["version", "DESC"]],
     });
@@ -412,7 +425,7 @@ const getDocument = async (req, res) => {
       include: [
         { model: Category },
         { model: DocumentType },
-        { model: User, as: "uploader", attributes: ["id", "email"] },
+        { model: User, as: "uploader", attributes: ["id", "name", "email"] },
       ],
     });
 
@@ -427,7 +440,7 @@ const getDocument = async (req, res) => {
       tenantId,
       req.user.id,
       req.user.role,
-      doc.documentTypeId
+      doc.documentTypeId,
     );
     if (!allowed) {
       return res.status(403).json({
@@ -464,7 +477,11 @@ const deleteDocument = async (req, res) => {
     // owner; a Tenant/Department Admin must force-unlock it first. No-op
     // when the document isn't checked out.
     try {
-      const root = await CheckInOutService.resolveRoot(req.models, doc.id, tenantId);
+      const root = await CheckInOutService.resolveRoot(
+        req.models,
+        doc.id,
+        tenantId,
+      );
       CheckInOutService.assertNotLockedByOther(root, req.user.id);
     } catch (lockError) {
       return res.status(lockError.statusCode || 423).json({
@@ -560,7 +577,9 @@ const reprocessOcr = async (req, res) => {
   });
 
   if (!document) {
-    return res.status(404).json({ success: false, message: "Document not found" });
+    return res
+      .status(404)
+      .json({ success: false, message: "Document not found" });
   }
 
   if (!document.tempFilePath || !fs.existsSync(document.tempFilePath)) {
@@ -568,11 +587,14 @@ const reprocessOcr = async (req, res) => {
     // there is nothing left on disk to re-OCR at that point.
     return res.status(400).json({
       success: false,
-      message: "Original file is no longer available for this document (it may already be finalized), so it can't be reprocessed.",
+      message:
+        "Original file is no longer available for this document (it may already be finalized), so it can't be reprocessed.",
     });
   }
 
-  const logs = Array.isArray(document.activityLogs) ? [...document.activityLogs] : [];
+  const logs = Array.isArray(document.activityLogs)
+    ? [...document.activityLogs]
+    : [];
   logs.push({
     message: "OCR reprocessing triggered manually...",
     status: "PROCESSING",
@@ -594,7 +616,11 @@ const reprocessOcr = async (req, res) => {
     status: AUDIT_STATUS.SUCCESS,
   });
 
-  return res.json({ success: true, message: "OCR reprocessing started", status: "OCR_PROCESSING" });
+  return res.json({
+    success: true,
+    message: "OCR reprocessing started",
+    status: "OCR_PROCESSING",
+  });
 };
 
 // ── Status ───────────────────────────────────────────────────
@@ -621,7 +647,6 @@ const getDocumentStatus = async (req, res) => {
     tcode: document.tcode,
   });
 };
-
 
 // ── Generate TCode ───────────────────────────────────────────
 const generateTcode = async (req, res) => {
@@ -667,7 +692,11 @@ const generateTcode = async (req, res) => {
   // exactly as before, and the frontend calls /finalize directly.
   let approval = { required: false, documentApproval: null };
   try {
-    approval = await ApprovalEngineService.initiate({ document, user: req.user, req });
+    approval = await ApprovalEngineService.initiate({
+      document,
+      user: req.user,
+      req,
+    });
   } catch (engineError) {
     console.error("Approval Engine initiate error:", engineError.message);
   }
@@ -704,7 +733,9 @@ const finalizeDocument = async (req, res) => {
   // after final approval. Documents with no approval workflow configured
   // have no DocumentApproval row at all, so this is a complete no-op for
   // them and they finalize exactly as before.
-  const documentApproval = await DocumentApproval.findOne({ where: { documentId: document.id } });
+  const documentApproval = await DocumentApproval.findOne({
+    where: { documentId: document.id },
+  });
   if (documentApproval && documentApproval.status !== "COMPLETED") {
     return res.status(409).json({
       success: false,
@@ -715,82 +746,85 @@ const finalizeDocument = async (req, res) => {
   }
   if (documentApproval && documentApproval.status === "COMPLETED") {
     // Already finalized to SAP by the Approval Engine on final approval.
-    return res.json({ success: true, message: "Document already finalized via approval workflow" });
+    return res.json({
+      success: true,
+      message: "Document already finalized via approval workflow",
+    });
   }
 
   // ── Subscription Management System: FREE tenants never reach SAP ──
   // code. Approval-engine gating above still applies identically to both;
   // only the "where does the binary end up" step differs.
- // ── Resolve tenant routing ─────────────────────────────────────
-// There are 3 effective tenant modes:
-//
-// 1. FREE              → existing local flow (UNCHANGED)
-// 2. PAID + ERP        → SAP flow (UNCHANGED)
-// 3. PAID + Non-ERP    → local flow (NEW)
-//
-// tenantType alone cannot determine the destination because both
-// Paid ERP and Paid Non-ERP tenants have tenantType = "PAID".
+  // ── Resolve tenant routing ─────────────────────────────────────
+  // There are 3 effective tenant modes:
+  //
+  // 1. FREE              → existing local flow (UNCHANGED)
+  // 2. PAID + ERP        → SAP flow (UNCHANGED)
+  // 3. PAID + Non-ERP    → local flow (NEW)
+  //
+  // tenantType alone cannot determine the destination because both
+  // Paid ERP and Paid Non-ERP tenants have tenantType = "PAID".
 
-const tenant = await req.masterModels.Tenant.findByPk(req.user.tenantId, {
-  attributes: ["id", "tenantType", "erpConfigId"],
-});
-
-if (!tenant) {
-  return res.status(404).json({
-    success: false,
-    message: "Tenant not found",
+  const tenant = await req.masterModels.Tenant.findByPk(req.user.tenantId, {
+    attributes: ["id", "tenantType", "erpConfigId"],
   });
-}
 
-// ── FREE TENANT ────────────────────────────────────────────────
-// IMPORTANT: Keep the existing FREE behavior exactly as it is.
-if (isFreeTenant(req)) {
-  try {
-    const result = await finalizeDocumentLocally(document, req);
-
-    return res.json({
-      success: true,
-      localFilePath: result.localFilePath,
-    });
-  } catch (error) {
-    return res.status(500).json({
+  if (!tenant) {
+    return res.status(404).json({
       success: false,
-      message: error.message,
+      message: "Tenant not found",
     });
   }
-}
 
-// ── PAID NON-ERP TENANT ────────────────────────────────────────
-// PAID does NOT automatically mean SAP.
-// If no ERP configuration is assigned, finalize locally.
-if (tenant.tenantType === "PAID" && !tenant.erpConfigId) {
-  try {
-    const result = await finalizeDocumentLocally(document, req);
+  // ── FREE TENANT ────────────────────────────────────────────────
+  // IMPORTANT: Keep the existing FREE behavior exactly as it is.
+  if (isFreeTenant(req)) {
+    try {
+      const result = await finalizeDocumentLocally(document, req);
 
-    return res.json({
-      success: true,
-      localFilePath: result.localFilePath,
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+      return res.json({
+        success: true,
+        localFilePath: result.localFilePath,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
   }
-}
 
-// ── PAID ERP TENANT ────────────────────────────────────────────
-// Existing SAP behavior remains unchanged.
-const sapData = await SapFinalizationService.finalizeDocumentToSap(
-  document,
-  req
-);
+  // ── PAID NON-ERP TENANT ────────────────────────────────────────
+  // PAID does NOT automatically mean SAP.
+  // If no ERP configuration is assigned, finalize locally.
+  if (tenant.tenantType === "PAID" && !tenant.erpConfigId) {
+    try {
+      const result = await finalizeDocumentLocally(document, req);
 
-res.json({
-  success: true,
-  sapDocumentId: sapData.sapDocumentId,
-  sapPhioId: sapData.sapPhioId,
-});
+      return res.json({
+        success: true,
+        localFilePath: result.localFilePath,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  }
+
+  // ── PAID ERP TENANT ────────────────────────────────────────────
+  // Existing SAP behavior remains unchanged.
+  const sapData = await SapFinalizationService.finalizeDocumentToSap(
+    document,
+    req,
+  );
+
+  res.json({
+    success: true,
+    sapDocumentId: sapData.sapDocumentId,
+    sapPhioId: sapData.sapPhioId,
+  });
 };
 
 // ── Activity log ─────────────────────────────────────────────
@@ -834,7 +868,7 @@ const searchByTcode = async (req, res) => {
         {
           model: User,
           as: "uploader",
-          attributes: ["id", "email"],
+          attributes: ["id", "name", "email"],
         },
       ],
     });
@@ -870,14 +904,27 @@ const viewDocument = async (req, res) => {
     const { Document } = req.models;
     if (isFreeTenant(req)) {
       const document = await Document.findOne({
-        where: { id: req.params.id, tenantId: req.user.tenantId, status: "ACTIVE" },
+        where: {
+          id: req.params.id,
+          tenantId: req.user.tenantId,
+          status: "ACTIVE",
+        },
       });
-      if (!document || !document.localFilePath || !fs.existsSync(document.localFilePath)) {
-        return res.status(404).json({ success: false, message: "Document not found" });
+      if (
+        !document ||
+        !document.localFilePath ||
+        !fs.existsSync(document.localFilePath)
+      ) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Document not found" });
       }
 
       const buffer = await fsPromises.readFile(document.localFilePath);
-      const watermarked = await WatermarkService.watermark(buffer, document.mimeType);
+      const watermarked = await WatermarkService.watermark(
+        buffer,
+        document.mimeType,
+      );
 
       await AuditService.log({
         req,
@@ -895,10 +942,16 @@ const viewDocument = async (req, res) => {
     // ── PAID tenants: :id here is our own Document row id, so resolve it
     // to the actual sapDocumentId before calling SAP.
     const document = await Document.findOne({
-      where: { id: req.params.id, tenantId: req.user.tenantId, status: "ACTIVE" },
+      where: {
+        id: req.params.id,
+        tenantId: req.user.tenantId,
+        status: "ACTIVE",
+      },
     });
     if (!document) {
-      return res.status(404).json({ success: false, message: "Document not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Document not found" });
     }
 
     // ── DB-backed SAP Content API storage ─────────────────────
@@ -915,7 +968,9 @@ const viewDocument = async (req, res) => {
         documentId: document.id,
       });
       if (!contentRow) {
-        return res.status(404).json({ success: false, message: "Document not found" });
+        return res
+          .status(404)
+          .json({ success: false, message: "Document not found" });
       }
 
       await AuditService.log({
@@ -928,7 +983,10 @@ const viewDocument = async (req, res) => {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      res.setHeader("Content-Type", document.mimeType || "application/octet-stream");
+      res.setHeader(
+        "Content-Type",
+        document.mimeType || "application/octet-stream",
+      );
       return res.send(contentRow.content);
     }
 
@@ -960,7 +1018,10 @@ const viewDocument = async (req, res) => {
     }
 
     const sapDocumentId = document.sapDocumentId;
-    const erpConfig = await getErpConfigForTenant(req.user.tenantId, req.masterModels);
+    const erpConfig = await getErpConfigForTenant(
+      req.user.tenantId,
+      req.masterModels,
+    );
     const erpService = ErpFactory.getService(erpConfig);
 
     const file = await erpService.getDocumentBinary(erpConfig, sapDocumentId);
@@ -1017,11 +1078,16 @@ const downloadDocument = async (req, res) => {
     // locally stored, dynamically watermarked copy — never SAP.
     if (isFreeTenant(req)) {
       if (!document.localFilePath || !fs.existsSync(document.localFilePath)) {
-        return res.status(404).json({ success: false, message: "Document not found" });
+        return res
+          .status(404)
+          .json({ success: false, message: "Document not found" });
       }
 
       const buffer = await fsPromises.readFile(document.localFilePath);
-      const watermarked = await WatermarkService.watermark(buffer, document.mimeType);
+      const watermarked = await WatermarkService.watermark(
+        buffer,
+        document.mimeType,
+      );
 
       await AuditService.log({
         req,
@@ -1033,7 +1099,10 @@ const downloadDocument = async (req, res) => {
       });
 
       res.setHeader("Content-Type", document.mimeType);
-      res.setHeader("Content-Disposition", `attachment; filename="${document.originalFileName}"`);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${document.originalFileName}"`,
+      );
       return res.send(watermarked);
     }
 
@@ -1046,7 +1115,9 @@ const downloadDocument = async (req, res) => {
         documentId: document.id,
       });
       if (!contentRow) {
-        return res.status(404).json({ success: false, message: "Document not found" });
+        return res
+          .status(404)
+          .json({ success: false, message: "Document not found" });
       }
 
       await AuditService.log({
@@ -1059,10 +1130,13 @@ const downloadDocument = async (req, res) => {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      res.setHeader("Content-Type", document.mimeType || "application/octet-stream");
+      res.setHeader(
+        "Content-Type",
+        document.mimeType || "application/octet-stream",
+      );
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="${document.originalFileName}"`
+        `attachment; filename="${document.originalFileName}"`,
       );
       return res.send(contentRow.content);
     }
@@ -1074,7 +1148,10 @@ const downloadDocument = async (req, res) => {
       });
     }
 
-    const erpConfig = await getErpConfigForTenant(req.user.tenantId, req.masterModels);
+    const erpConfig = await getErpConfigForTenant(
+      req.user.tenantId,
+      req.masterModels,
+    );
 
     const erpService = ErpFactory.getService(erpConfig);
 
@@ -1122,11 +1199,17 @@ const getDocumentThumbnail = async (req, res) => {
   try {
     const { Document } = req.models;
     const document = await Document.findOne({
-      where: { id: req.params.id, tenantId: req.user.tenantId, status: "ACTIVE" },
+      where: {
+        id: req.params.id,
+        tenantId: req.user.tenantId,
+        status: "ACTIVE",
+      },
     });
 
     if (!document) {
-      return res.status(404).json({ success: false, message: "Document not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Document not found" });
     }
 
     let sourceBuffer;
@@ -1134,7 +1217,9 @@ const getDocumentThumbnail = async (req, res) => {
 
     if (isFreeTenant(req)) {
       if (!document.localFilePath || !fs.existsSync(document.localFilePath)) {
-        return res.status(404).json({ success: false, message: "Document not found" });
+        return res
+          .status(404)
+          .json({ success: false, message: "Document not found" });
       }
       sourceBuffer = await fsPromises.readFile(document.localFilePath);
     } else {
@@ -1148,7 +1233,9 @@ const getDocumentThumbnail = async (req, res) => {
           documentId: document.id,
         });
         if (!contentRow) {
-          return res.status(404).json({ success: false, message: "Document not found" });
+          return res
+            .status(404)
+            .json({ success: false, message: "Document not found" });
         }
         sourceBuffer = contentRow.content;
         mimeType = document.mimeType || mimeType;
@@ -1156,12 +1243,19 @@ const getDocumentThumbnail = async (req, res) => {
         if (!document.sapDocumentId) {
           return res.status(400).json({
             success: false,
-            message: "This document has no SAP reference (upload may have failed)",
+            message:
+              "This document has no SAP reference (upload may have failed)",
           });
         }
-        const erpConfig = await getErpConfigForTenant(req.user.tenantId, req.masterModels);
+        const erpConfig = await getErpConfigForTenant(
+          req.user.tenantId,
+          req.masterModels,
+        );
         const erpService = ErpFactory.getService(erpConfig);
-        const file = await erpService.getDocumentBinary(erpConfig, document.sapDocumentId);
+        const file = await erpService.getDocumentBinary(
+          erpConfig,
+          document.sapDocumentId,
+        );
         sourceBuffer = file.buffer;
         mimeType = file.contentType || mimeType;
       }
@@ -1172,7 +1266,9 @@ const getDocumentThumbnail = async (req, res) => {
       thumbnail = await ThumbnailService.generate(sourceBuffer, mimeType);
     } catch (thumbErr) {
       // Unsupported type (e.g. .docx) — no thumbnail available.
-      return res.status(415).json({ success: false, message: thumbErr.message });
+      return res
+        .status(415)
+        .json({ success: false, message: thumbErr.message });
     }
 
     if (isFreeTenant(req)) {
@@ -1211,7 +1307,9 @@ const getDocumentVersions = async (req, res) => {
         [Op.or]: [{ id: rootId }, { parentDocumentId: rootId }],
         status: "ACTIVE",
       },
-      include: [{ model: User, as: "uploader", attributes: ["id", "email"] }],
+      include: [
+        { model: User, as: "uploader", attributes: ["id", "name", "email"] },
+      ],
       order: [["version", "DESC"]],
     });
 
@@ -1251,20 +1349,46 @@ const searchDocuments = async (req, res) => {
       userId: req.user.id,
       role: req.user.role,
       query: q,
-      filters: { departmentId, categoryId, documentTypeId, uploadStatus, sourceType, dateFrom, dateTo },
+      filters: {
+        departmentId,
+        categoryId,
+        documentTypeId,
+        uploadStatus,
+        sourceType,
+        dateFrom,
+        dateTo,
+      },
       page,
       limit,
     });
 
-    return res.json({ success: true, data: result.data, pagination: result.pagination });
+    return res.json({
+      success: true,
+      data: result.data,
+      pagination: result.pagination,
+    });
   } catch (error) {
-    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+    return res
+      .status(error.statusCode || 500)
+      .json({ success: false, message: error.message });
   }
 };
 const searchAdvanced = async (req, res) => {
   try {
     const tenantId = req.user.tenantId;
-    const { q, tcode, poNumber, uploadStatus, departmentId, categoryId, documentTypeId, fromDate, toDate, page, limit } = req.query;
+    const {
+      q,
+      tcode,
+      poNumber,
+      uploadStatus,
+      departmentId,
+      categoryId,
+      documentTypeId,
+      fromDate,
+      toDate,
+      page,
+      limit,
+    } = req.query;
 
     const result = await documentSearchService.advancedSearch({
       models: req.models,
@@ -1272,14 +1396,32 @@ const searchAdvanced = async (req, res) => {
       tenantId,
       userId: req.user.id,
       role: req.user.role,
-      filters: { q, tcode, poNumber, uploadStatus, departmentId, categoryId, documentTypeId, fromDate, toDate },
+      filters: {
+        q,
+        tcode,
+        poNumber,
+        uploadStatus,
+        departmentId,
+        categoryId,
+        documentTypeId,
+        fromDate,
+        toDate,
+      },
       page,
       limit,
     });
 
-    return res.json({ success: true, data: result.data, total: result.total, page: result.page, totalPages: result.totalPages });
+    return res.json({
+      success: true,
+      data: result.data,
+      total: result.total,
+      page: result.page,
+      totalPages: result.totalPages,
+    });
   } catch (error) {
-    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+    return res
+      .status(error.statusCode || 500)
+      .json({ success: false, message: error.message });
   }
 };
 
@@ -1301,4 +1443,4 @@ module.exports = {
   downloadDocument,
   getDocumentThumbnail,
   getDocumentVersions,
-}; 
+};

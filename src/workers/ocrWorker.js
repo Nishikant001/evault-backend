@@ -1,5 +1,5 @@
 // src/workers/ocrWorker.js
-const OcrService = require("../services/ocrService");
+const { runOcr } = require("../services/ocr/engineSelector");
 const AuditService = require("../services/auditService");
 const { AUDIT_ACTIONS, AUDIT_MODULES, AUDIT_STATUS } = require("../constants/auditActions");
 
@@ -46,24 +46,47 @@ async function processOCR(documentId, models) {
     });
     await document.update({ activityLogs: logs });
 
-    const metadata = await OcrService.process(document.tempFilePath);
+    // Central engine selection (Tesseract by default; licensed provider only when
+    // the tenant is entitled + enabled + configured). May throw OcrEngineError
+    // (provider failed and fallback disabled) — handled in the catch below with
+    // the source file retained so the job is recoverable via reprocess.
+    const run = await runOcr({ models, tenantId: document.tenantId, filePath: document.tempFilePath });
+    let extractedText = run.ocrData.extractedText || "";
+    const metadata = { extractedText, ocrData: run.ocrData };
 
+    // Never replace a previously good extraction with an empty one.
+    const previousText = document.ocrMetadata && document.ocrMetadata.extractedText;
+    if (!extractedText.trim() && previousText) {
+      extractedText = previousText;
+      metadata.extractedText = previousText;
+      logs.push({ message: "New OCR run produced no text; previous extracted text was kept.", status: "INFO", timestamp: new Date() });
+    }
+
+    if (run.fallbackUsed && run.providerError) {
+      logs.push({ message: `Licensed OCR provider unavailable (${run.providerError.code}); Tesseract fallback was used.`, status: "INFO", timestamp: new Date() });
+    }
+    const failedPages = (run.ocrData.pages || []).filter((p) => p.error);
+    if (failedPages.length) {
+      logs.push({ message: `OCR completed with ${failedPages.length} page(s) not recognised: ${failedPages.map((p) => p.pageNumber).join(", ")}`, status: "INFO", timestamp: new Date() });
+    }
     logs.push({
-      message:   "OCR completed successfully",
+      message:   `OCR completed successfully (engine: ${run.engineUsed}${run.ocrData.status === "PARTIAL" ? ", partial" : ""})`,
       status:    "SUCCESS",
       timestamp: new Date(),
     });
 
-    // NOTE: the old static Invoice-shaped field list (invoiceNumber,
-    // poNumber, vendorName, ...) from OcrService.parseFields() is
-    // intentionally NOT persisted anymore — the Dynamic Metadata
-    // Template Engine (DocumentMetadata table, below) is now the single
-    // source of truth for extracted fields. We still keep `extractedText`
-    // here because documentIndexingService / vectorSearchService (AI
-    // Document Assistant chat search) read it straight off
-    // document.ocrMetadata.extractedText.
+    // NOTE: the old static Invoice-shaped field list is intentionally NOT
+    // persisted — DocumentMetadata (template-driven) is the source of truth.
+    // `extractedText` stays here because the AI indexing / search read it from
+    // document.ocrMetadata.extractedText. Engine info is additive.
     await document.update({
-      ocrMetadata:  { extractedText: metadata.extractedText },
+      ocrMetadata:  {
+        extractedText,
+        engine: { requested: run.engineRequested, used: run.engineUsed, fallbackUsed: run.fallbackUsed, providerError: run.providerError ? { code: run.providerError.code, message: run.providerError.message } : null },
+        status: run.ocrData.status || "COMPLETED",
+        pageCount: run.ocrData.pageCount,
+        pageSources: (run.ocrData.pages || []).map((p) => ({ page: p.pageNumber, source: p.source || null, error: p.error || null })),
+      },
       uploadStatus: "OCR_COMPLETED",
       activityLogs: logs,
     });
@@ -83,6 +106,9 @@ async function processOCR(documentId, models) {
         tenantId: document.tenantId,
         documentTypeId: document.documentTypeId,
         extractedText: metadata.extractedText,
+        ocrData: metadata.ocrData,
+        ocrRun: run,
+        models,
         legacyFields: null, // static field list retired — see note above
       });
     } catch (dynamicMappingError) {
@@ -120,9 +146,13 @@ async function processOCR(documentId, models) {
       module: AUDIT_MODULES.OCR,
       action: AUDIT_ACTIONS.OCR_COMPLETED,
       documentId: document.id,
-      remarks: `OCR completed for document ${document.id}`,
+      remarks: `OCR completed for document ${document.id} (engine: ${run.engineUsed}${run.fallbackUsed ? ", fallback" : ""})`,
       status: AUDIT_STATUS.SUCCESS,
     });
+    if (run.fallbackUsed) {
+      await AuditService.log({ models, userId: document.uploadedBy, tenantId: document.tenantId, module: AUDIT_MODULES.OCR, action: AUDIT_ACTIONS.OCR_FALLBACK_USED, documentId: document.id,
+        remarks: `Tesseract fallback used for document ${document.id}${run.providerError ? ` (provider error: ${run.providerError.code})` : ""}`, status: AUDIT_STATUS.SUCCESS });
+    }
 
   } catch (error) {
     console.error(`[OCR] Failed for document ${documentId}:`, error.message);
@@ -133,7 +163,7 @@ async function processOCR(documentId, models) {
           ? [...document.activityLogs]
           : [];
         logs.push({
-          message:   "OCR failed: " + error.message,
+          message:   "OCR failed: " + error.message + (error.recoverable ? " (source file retained; you can retry after fixing the OCR settings)" : ""),
           status:    "FAILED",
           timestamp: new Date(),
         });

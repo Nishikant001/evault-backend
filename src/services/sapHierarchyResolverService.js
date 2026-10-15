@@ -186,25 +186,31 @@ async function resolveOrCreateCategory(rawCode, department, tenantId, cache, mas
     const code = normalizeCode(rawCode);
 
   let tenantDept = await TenantDepartment.findOne({
-    where: { tenantId, departmentId: department.id },
-    transaction,
-  });
+  where: { tenantId, departmentId: department.id },
+  transaction: masterTransaction,
+});
   if (!tenantDept) {
     await TenantDepartment.create(
-      { tenantId, departmentId: department.id, status: "ACTIVE" },
-      { transaction },
-    );
+  { tenantId, departmentId: department.id, status: "ACTIVE" },
+  { transaction: masterTransaction },
+);
   } else if (tenantDept.status !== "ACTIVE") {
-    await tenantDept.update({ status: "ACTIVE" }, { transaction });
+    await tenantDept.update(
+  { status: "ACTIVE" },
+  { transaction: masterTransaction }
+);
   }
 
   let existing = await Category.findOne({
-    where: {
-      tenantId,
-      [Op.or]: [{ sapCode: code }, { name: code, departmentId: department.id }],
-    },
-    transaction,
-  });
+  where: {
+    tenantId,
+    [Op.or]: [
+      { sapCode: code },
+      { name: code, departmentId: department.id },
+    ],
+  },
+  transaction: tenantTransaction,
+});
 
   const mapped = resolveNodeFields(code, cache.categories, "Category");
 
@@ -218,7 +224,7 @@ async function resolveOrCreateCategory(rawCode, department, tenantId, cache, mas
         status: mapped.status,
         lastSyncedAt: new Date(),
       },
-      { transaction },
+      { transaction: tenantTransaction },
     );
     return { category: existing, action: "updated" };
   }
@@ -233,7 +239,7 @@ async function resolveOrCreateCategory(rawCode, department, tenantId, cache, mas
       sapCode: code,
       lastSyncedAt: new Date(),
     },
-    { transaction },
+    { transaction: tenantTransaction },
   );
   return { category: created, action: "created" };
 }
@@ -246,12 +252,15 @@ async function resolveOrCreateDocumentType(rawCode, category, tenantId, cache, t
     const code = normalizeCode(rawCode);
 
   let existing = await DocumentType.findOne({
-    where: {
-      tenantId,
-      [Op.or]: [{ sapCode: code }, { name: code, categoryId: category.id }],
-    },
-    transaction,
-  });
+  where: {
+    tenantId,
+    [Op.or]: [
+      { sapCode: code },
+      { name: code, categoryId: category.id },
+    ],
+  },
+  transaction: tenantTransaction,
+});
 
   const mapped = resolveNodeFields(code, cache.documentTypes, "Document Type");
 
@@ -265,7 +274,7 @@ async function resolveOrCreateDocumentType(rawCode, category, tenantId, cache, t
         status: mapped.status,
         lastSyncedAt: new Date(),
       },
-      { transaction },
+      { transaction: tenantTransaction },
     );
     return { documentType: existing, action: "updated" };
   }
@@ -280,7 +289,7 @@ async function resolveOrCreateDocumentType(rawCode, category, tenantId, cache, t
       sapCode: code,
       lastSyncedAt: new Date(),
     },
-    { transaction },
+    { transaction: tenantTransaction },
   );
   return { documentType: created, action: "created" };
 }

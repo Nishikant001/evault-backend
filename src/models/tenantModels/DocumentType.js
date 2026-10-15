@@ -55,6 +55,10 @@ module.exports = (sequelize) => sequelize.define(
       allowNull: true,
       comment: "SAP DocumentTypeSet code — set by SAP Master Synchronization",
     },
+      erpConfigId: {                    // ← ADD
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
     lastSyncedAt: {
       type: DataTypes.DATE,
       allowNull: true,

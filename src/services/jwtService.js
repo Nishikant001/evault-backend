@@ -3,19 +3,20 @@ const jwt = require("jsonwebtoken");
 class JwtService {
 
   static generateAccessToken(user) {
-    return jwt.sign(
-      {
-        id: user.id,
-        role: user.role,
-        tenantId: user.tenantId,
-        email: user.email,
-      },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: "7d",
-      }
-    );
-  }
+  return jwt.sign(
+    {
+      id: user.id,
+      name: user.name,
+      role: user.role,
+      tenantId: user.tenantId,
+      email: user.email,
+    },
+    process.env.JWT_SECRET,
+    {
+      expiresIn: "7d",
+    }
+  );
+}
 
   static generateRefreshToken(user) {
     return jwt.sign(
@@ -28,6 +29,8 @@ class JwtService {
         // these fields undefined, handled as a legacy fallback.
         role: user.role,
         tenantId: user.tenantId,
+        email: user.email,
+        name: user.name,
       },
       process.env.JWT_REFRESH_SECRET,
       {

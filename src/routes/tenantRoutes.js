@@ -94,6 +94,15 @@ router.put(
   TenantController.update
 );
 
+// PHASE 3 (multi-ERP sync management), PART 2 — "Set Default" action on
+// the Super Admin tenant ERP assignment UI.
+router.put(
+  "/:id/erp-connections/:erpConfigId/default",
+  authMiddleware,
+  roleMiddleware("SuperAdmin"),
+  TenantController.setDefaultErpConnection
+);
+
 router.delete(
   "/:id",
   authMiddleware,

@@ -10,6 +10,11 @@
 // Field-for-field identical to legacy src/models/ErpConfig.js.
 const { DataTypes } = require("sequelize");
 const masterSequelize = require("../../config/masterDatabase");
+const {
+  PROTOCOLS,
+  AUTH_TYPES,
+  normalizeErpType,
+} = require("../../services/connector/connectorSchema");
 
 const ErpConfig = masterSequelize.define(
   "ErpConfig",
@@ -57,9 +62,46 @@ const ErpConfig = masterSequelize.define(
       defaultValue: false,
     },
 
+    // DYNAMIC ERP CONNECTOR (Step 1): was ENUM("SAP","ORACLE","CUSTOM").
+    // Now free text (e.g. SAP, ORACLE, ODOO, NETSUITE, MY_ERP) so adding
+    // an ERP never needs a schema change. Always stored UPPER_SNAKE_CASE.
     erpType: {
-      type: DataTypes.ENUM("SAP", "ORACLE", "CUSTOM"),
+      type: DataTypes.STRING(50),
       allowNull: false,
+      set(value) {
+        this.setDataValue("erpType", normalizeErpType(value) || value);
+      },
+      validate: {
+        isValidErpType(value) {
+          if (!normalizeErpType(value)) {
+            throw new Error(
+              "erpType must be 2-50 characters: letters, digits or underscore, starting with a letter",
+            );
+          }
+        },
+      },
+    },
+
+    // How the generic connector engine talks to this ERP.
+    // SAP rows use the dedicated SAP OData engine and ignore connectorConfig.
+    protocol: {
+      type: DataTypes.STRING(20),
+      allowNull: false,
+      defaultValue: "REST",
+      validate: { isIn: [PROTOCOLS] },
+    },
+
+    // Declarative connector description (see services/connector/connectorSchema.js).
+    // NEVER holds secrets — those stay in the encrypted columns below.
+    connectorConfig: {
+      type: DataTypes.JSON,
+      allowNull: true,
+    },
+
+    // Which template this ERP was created from (informational).
+    templateKey: {
+      type: DataTypes.STRING(100),
+      allowNull: true,
     },
 
     // Outbound Evault -> ERP endpoint. Nullable for inbound-only SAP integrations.
@@ -95,9 +137,12 @@ const ErpConfig = masterSequelize.define(
       type: DataTypes.STRING,
     },
 
+    // Was ENUM("BASIC","BEARER","API_KEY"); now also NONE and
+    // OAUTH2_CLIENT_CREDENTIALS (client id -> username, secret -> password).
     authType: {
-      type: DataTypes.ENUM("BASIC", "BEARER", "API_KEY"),
+      type: DataTypes.STRING(30),
       defaultValue: "BASIC",
+      validate: { isIn: [AUTH_TYPES] },
     },
 
     apiKey: {

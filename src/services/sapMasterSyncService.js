@@ -31,6 +31,7 @@ const {
   masterSequelize,
   Tenant,
   ErpConfig,
+  TenantErpConnection,
   Department,
   TenantDepartment,
 } = require("../models/masterDb");
@@ -80,8 +81,60 @@ function runDepartmentSyncSerialized(fn) {
  * module is SAP-specific per the brief's title). Throws a clear error
  * otherwise — mirrors the getErpConfigForTenant helper already used by
  * documentController.js / sapFinalizationService.js.
+ *
+ * PHASE 2 (multi-ERP sync) — `erpConfigId` is optional and, when passed,
+ * lets a tenant with more than one ERP connection pick which one to sync.
+ * Resolution order:
+ *
+ *  1. erpConfigId explicitly given -> it MUST be one of this tenant's own
+ *     ACTIVE TenantErpConnection rows (tenant-isolation check — a tenant
+ *     can never sync another tenant's ERP just by passing its id) and it
+ *     MUST be erpType SAP.
+ *  2. No erpConfigId given, tenant has exactly ONE active SAP connection
+ *     in TenantErpConnection -> use it. This is what makes existing
+ *     single-ERP tenants keep working unchanged after the Phase 1
+ *     migration backfilled tenant_erp_connections for every tenant that
+ *     already had a legacy erpConfigId.
+ *  3. No erpConfigId given, tenant has MULTIPLE active SAP connections ->
+ *     there is no per-connection "default" flag in the schema yet, so
+ *     rather than guessing, this throws and asks the caller to pass
+ *     erpConfigId explicitly (see TENANT_MULTI_ERP_CONNECTIONS.md).
+ *  4. No TenantErpConnection rows at all (tenant predates Phase 1 / was
+ *     never migrated) -> fall back to the legacy tenant.ErpConfig lookup,
+ *     exactly as before.
  */
-async function getSapErpConfigForTenant(tenantId) {
+async function getSapErpConfigForTenant(tenantId, erpConfigId) {
+  if (erpConfigId) {
+    const connection = await TenantErpConnection.findOne({
+      where: { tenantId, erpConfigId, isActive: true },
+      include: [{ model: ErpConfig, as: "erpConfig" }],
+    });
+    if (!connection || !connection.erpConfig) {
+      throw new Error("Requested ERP configuration is not assigned to this tenant");
+    }
+    if (connection.erpConfig.erpType !== "SAP") {
+      throw new Error(
+        `Requested ERP configuration is of type ${connection.erpConfig.erpType}; SAP Master Synchronization only supports SAP`,
+      );
+    }
+    return connection.erpConfig;
+  }
+
+  const activeSapConnections = await TenantErpConnection.findAll({
+    where: { tenantId, isActive: true },
+    include: [{ model: ErpConfig, as: "erpConfig", where: { erpType: "SAP" }, required: true }],
+  });
+
+  if (activeSapConnections.length === 1) {
+    return activeSapConnections[0].erpConfig;
+  }
+  if (activeSapConnections.length > 1) {
+    throw new Error(
+      "Tenant has multiple active SAP ERP connections; please specify erpConfigId",
+    );
+  }
+
+  // No TenantErpConnection rows yet for this tenant — legacy fallback.
   const tenant = await Tenant.findByPk(tenantId, {
     include: [{ model: ErpConfig }],
   });
@@ -117,6 +170,7 @@ async function syncDepartments(erpConfig, { sapSyncLogId, tenantId } = {}) {
       });
       await RetryQueueService.enqueue({
         tenantId,
+        erpConfigId: erpConfig.id, // MULTI-ERP FIX
         entityType: SAP_SYNC_ENTITY_TYPE.DEPARTMENT,
         referenceCode:
           mapped.code || `UNKNOWN_${JSON.stringify(rec).slice(0, 40)}`,
@@ -211,12 +265,14 @@ async function syncDepartments(erpConfig, { sapSyncLogId, tenantId } = {}) {
                 tenantId,
                 departmentId: department.id,
                 status: "ACTIVE",
+                                erpConfigId: erpConfig.id,          // ← ADD
+
               },
               { transaction: t },
             );
           } else if (existingTenantDepartment.status !== "ACTIVE") {
             await existingTenantDepartment.update(
-              { status: "ACTIVE" },
+              { status: "ACTIVE", erpConfigId: erpConfig.id  },
               { transaction: t },
             );
           }
@@ -250,6 +306,7 @@ async function syncDepartments(erpConfig, { sapSyncLogId, tenantId } = {}) {
 
       await RetryQueueService.enqueue({
         tenantId,
+        erpConfigId: erpConfig.id, // MULTI-ERP FIX
         entityType: SAP_SYNC_ENTITY_TYPE.DEPARTMENT,
         referenceCode: mapped.code,
         payload: mapped,
@@ -338,7 +395,7 @@ async function syncCategories(erpConfig, { sapSyncLogId, tenantId }) {
             transaction: t,
           });
 
-          if (existing) {
+                   if (existing) {
             await existing.update(
               {
                 name: mapped.name,
@@ -346,6 +403,7 @@ async function syncCategories(erpConfig, { sapSyncLogId, tenantId }) {
                 description: mapped.description,
                 status: mapped.status,
                 lastSyncedAt: new Date(),
+                erpConfigId: erpConfig.id,
               },
               { transaction: t },
             );
@@ -360,6 +418,7 @@ async function syncCategories(erpConfig, { sapSyncLogId, tenantId }) {
                 status: mapped.status,
                 sapCode: mapped.code,
                 lastSyncedAt: new Date(),
+                erpConfigId: erpConfig.id,
               },
               { transaction: t },
             );
@@ -384,6 +443,7 @@ async function syncCategories(erpConfig, { sapSyncLogId, tenantId }) {
       });
       await RetryQueueService.enqueue({
         tenantId,
+        erpConfigId: erpConfig.id, // MULTI-ERP FIX
         entityType: SAP_SYNC_ENTITY_TYPE.CATEGORY,
         referenceCode:
           mapped.code || `UNKNOWN_${JSON.stringify(rec).slice(0, 40)}`,
@@ -445,7 +505,7 @@ async function syncDocumentTypes(erpConfig, { sapSyncLogId, tenantId }) {
             transaction: t,
           });
 
-          if (existing) {
+                   if (existing) {
             await existing.update(
               {
                 name: mapped.name,
@@ -453,6 +513,7 @@ async function syncDocumentTypes(erpConfig, { sapSyncLogId, tenantId }) {
                 description: mapped.description,
                 status: mapped.status,
                 lastSyncedAt: new Date(),
+                erpConfigId: erpConfig.id,
               },
               { transaction: t },
             );
@@ -467,6 +528,7 @@ async function syncDocumentTypes(erpConfig, { sapSyncLogId, tenantId }) {
                 status: mapped.status,
                 sapCode: mapped.code,
                 lastSyncedAt: new Date(),
+                erpConfigId: erpConfig.id,
               },
               { transaction: t },
             );
@@ -491,6 +553,7 @@ async function syncDocumentTypes(erpConfig, { sapSyncLogId, tenantId }) {
       });
       await RetryQueueService.enqueue({
         tenantId,
+        erpConfigId: erpConfig.id, // MULTI-ERP FIX
         entityType: SAP_SYNC_ENTITY_TYPE.DOCUMENT_TYPE,
         referenceCode:
           mapped.code || `UNKNOWN_${JSON.stringify(rec).slice(0, 40)}`,
@@ -509,8 +572,8 @@ async function syncDocumentTypes(erpConfig, { sapSyncLogId, tenantId }) {
  * that order, for one tenant. Returns the combined counters/summary the
  * caller (sapSyncController / scheduler) writes into the SapSyncLog row.
  */
-async function syncMasters({ tenantId, sapSyncLogId }) {
-  const erpConfig = await getSapErpConfigForTenant(tenantId);
+async function syncMasters({ tenantId, sapSyncLogId, erpConfigId }) {
+  const erpConfig = await getSapErpConfigForTenant(tenantId, erpConfigId);
 
   // Department is global — serialize it across ALL tenants (see the
   // "Global Department-sync mutex" comment above) so two tenants'
@@ -557,6 +620,11 @@ async function syncMasters({ tenantId, sapSyncLogId }) {
       typeResult.counters.failed,
     summary,
     errors,
+    // Which ErpConfig actually drove this run — orchestrator uses this to
+    // stamp the SapSyncLog row correctly even when erpConfigId wasn't
+    // passed in and this fell back to the tenant's single active SAP
+    // connection / legacy tenant.ErpConfig.
+    erpConfigId: erpConfig.id,
   };
 }
 

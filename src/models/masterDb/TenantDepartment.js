@@ -26,6 +26,10 @@ const TenantDepartment = masterSequelize.define(
       type: DataTypes.ENUM("ACTIVE", "INACTIVE"),
       defaultValue: "ACTIVE",
     },
+    erpConfigId: {                    // ← ADD
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
   },
   {
     tableName: "tenant_departments",

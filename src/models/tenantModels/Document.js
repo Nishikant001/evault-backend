@@ -92,10 +92,14 @@ module.exports = (sequelize) => sequelize.define(
       unique: true,
       comment: "DocumentId returned by SAP GenerateUploadUrl, or the original SAP DocumentMetaSet Documentid for synced documents",
     },
-    sapPhioId: {
+        sapPhioId: {
       type: DataTypes.STRING,
       allowNull: true,
       comment: "PHIOId returned by SAP GenerateUploadUrl",
+    },
+    erpConfigId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
     },
 
     // ── SAP Document Synchronization ────────────────────────

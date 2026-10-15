@@ -13,6 +13,8 @@
 // CALLER belongs to, and SuperAdmin has none of their own (see
 // authMiddleware.js's SuperAdmin bridge).
 
+const userAssignmentService = require("../services/userAssignmentService");
+
 function resolveTenantId(req) {
   if (req.user.role === "SuperAdmin") {
     return null; // see header comment — cross-tenant not yet supported
@@ -75,8 +77,34 @@ const listCompanyCodes = async (req, res) => {
     }
 
     const { CompanyCode } = req.models;
+    const tenantId = req.user.tenantId;
+    const where = { tenantId, status: "ACTIVE" };
+
+    // Authorization: a restricted user (assigned to specific
+    // department/category/documentType) should only ever see the
+    // Company Code(s) that sit above their own assigned department's
+    // plant — not every company code in the tenant. TenantAdmin/
+    // SuperAdmin (and any user with zero assignments) stay unrestricted.
+    const scope = await userAssignmentService.resolveScope(
+      req.models,
+      tenantId,
+      req.user.id,
+      req.user.role
+    );
+    if (scope) {
+      const locationScope = await userAssignmentService.resolveLocationScope(
+        req.models,
+        tenantId,
+        scope
+      );
+      if (!locationScope.companyCodeIds.length) {
+        return res.json({ success: true, count: 0, data: [] });
+      }
+      where.id = locationScope.companyCodeIds;
+    }
+
     const companyCodes = await CompanyCode.findAll({
-      where: { tenantId: req.user.tenantId, status: "ACTIVE" },
+      where,
       order: [["name", "ASC"]],
     });
 
