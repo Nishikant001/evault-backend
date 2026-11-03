@@ -31,15 +31,28 @@
 //     Sequelize connection or User table.
 
 const jwt = require("jsonwebtoken");
+const { Op } = require("sequelize");
 const masterModels = require("../models/masterDb");
-const { getTenantConnection, TenantProvisioningError } = require("./tenantConnectionManager");
+const {
+  getTenantConnection,
+  TenantProvisioningError,
+} = require("./tenantConnectionManager");
 const CommunicationService = require("./communicationService");
 const CommunicationPresenceService = require("./communicationPresenceService");
 const CommunicationCallService = require("./communicationCallService");
 const NotificationCenterService = require("./notificationCenterService");
 const AuditService = require("./auditService");
-const { AUDIT_ACTIONS, AUDIT_MODULES, AUDIT_STATUS } = require("../constants/auditActions");
-const { SOCKET_EVENTS, CALL_TYPES, CALL_STATUS, CALL_CONFIG } = require("../constants/communicationConstants");
+const {
+  AUDIT_ACTIONS,
+  AUDIT_MODULES,
+  AUDIT_STATUS,
+} = require("../constants/auditActions");
+const {
+  SOCKET_EVENTS,
+  CALL_TYPES,
+  CALL_STATUS,
+  CALL_CONFIG,
+} = require("../constants/communicationConstants");
 
 function userRoom(userId) {
   return `user:${userId}`;
@@ -69,8 +82,10 @@ function clearCall(callId) {
   if (!call) return null;
   if (call.ringTimer) clearTimeout(call.ringTimer);
   activeCallsById.delete(callId);
-  if (activeCallIdByUser.get(call.callerId) === callId) activeCallIdByUser.delete(call.callerId);
-  if (activeCallIdByUser.get(call.calleeId) === callId) activeCallIdByUser.delete(call.calleeId);
+  if (activeCallIdByUser.get(call.callerId) === callId)
+    activeCallIdByUser.delete(call.callerId);
+  if (activeCallIdByUser.get(call.calleeId) === callId)
+    activeCallIdByUser.delete(call.calleeId);
   return call;
 }
 /** Terminal status inferred from where the call was when it ended,
@@ -79,6 +94,55 @@ function terminalStatusFor(call) {
   if (call.status === CALL_STATUS.CONNECTED) return CALL_STATUS.COMPLETED;
   if (call.status === CALL_STATUS.RINGING) return CALL_STATUS.CANCELLED;
   return CALL_STATUS.FAILED;
+}
+
+/** Marks every not-yet-delivered message addressed to `userId` as delivered the
+ * moment they connect, and tells each sender (one event per conversation) so
+ * their UI can upgrade single ticks to double ticks. Failures never block the
+ * connection. */
+async function deliverPending(models, tenantId, userId) {
+  try {
+    const { CommunicationParticipant, CommunicationMessage } = models;
+    const memberships = await CommunicationParticipant.findAll({
+      where: { tenantId, userId, leftAt: null },
+      attributes: ["conversationId"],
+    });
+    const conversationIds = memberships.map((m) => m.conversationId);
+    if (!conversationIds.length) return;
+
+    const pending = await CommunicationMessage.findAll({
+      where: {
+        tenantId,
+        conversationId: conversationIds,
+        deliveredAt: null,
+        senderId: { [Op.ne]: userId },
+      },
+      attributes: ["id", "conversationId", "senderId"],
+      raw: true,
+    });
+    if (!pending.length) return;
+
+    const deliveredAt = new Date();
+    await CommunicationMessage.update(
+      { deliveredAt },
+      { where: { id: pending.map((m) => m.id), tenantId } },
+    );
+
+    const latest = new Map(); // `${senderId}:${conversationId}` -> highest message id
+    for (const m of pending) {
+      const key = `${m.senderId}:${m.conversationId}`;
+      if (!latest.has(key) || latest.get(key).id < m.id) latest.set(key, m);
+    }
+    for (const m of latest.values()) {
+      emitToUser(m.senderId, SOCKET_EVENTS.MESSAGE_DELIVERED, {
+        conversationId: m.conversationId,
+        upToMessageId: m.id,
+        deliveredAt,
+      });
+    }
+  } catch (error) {
+    console.log("Communication deliverPending error:", error.message);
+  }
 }
 
 let ioInstance = null;
@@ -90,7 +154,10 @@ function init(server) {
 
   const io = new Server(server, {
     cors: {
-      origin: (process.env.COMMUNICATION_SOCKET_ORIGIN || "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173")
+      origin: (
+        process.env.COMMUNICATION_SOCKET_ORIGIN ||
+        "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173"
+      )
         .split(",")
         .map((s) => s.trim()),
       credentials: true,
@@ -108,27 +175,34 @@ function init(server) {
   // place). ────────────────────────────────────────────────────────
   io.use(async (socket, next) => {
     try {
-      const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace("Bearer ", "");
+      const token =
+        socket.handshake.auth?.token ||
+        socket.handshake.headers?.authorization?.replace("Bearer ", "");
       if (!token) return next(new Error("Authentication token missing"));
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      if (!decoded || !decoded.id || !decoded.role) return next(new Error("Invalid or expired token"));
+      if (!decoded || !decoded.id || !decoded.role)
+        return next(new Error("Invalid or expired token"));
 
       if (decoded.role === "SuperAdmin") {
-        return next(new Error("Communication is not available for SuperAdmin sessions"));
+        return next(
+          new Error("Communication is not available for SuperAdmin sessions"),
+        );
       }
 
       const tenantId = decoded.tenantId;
       if (!tenantId) return next(new Error("User has no tenant assigned"));
 
       const tenant = await masterModels.Tenant.findByPk(tenantId);
-      if (!tenant || tenant.status !== "ACTIVE") return next(new Error("Invalid tenant"));
+      if (!tenant || tenant.status !== "ACTIVE")
+        return next(new Error("Invalid tenant"));
 
       let conn;
       try {
         conn = await getTenantConnection(tenantId);
       } catch (err) {
-        if (err instanceof TenantProvisioningError) return next(new Error(err.message));
+        if (err instanceof TenantProvisioningError)
+          return next(new Error(err.message));
         throw err;
       }
 
@@ -160,7 +234,11 @@ function init(server) {
     // conversation screen (if any) they currently have open.
     socket.join(userRoom(userId));
 
-    const wasOffline = CommunicationPresenceService.addConnection(tenantId, userId, socket.id);
+    const wasOffline = CommunicationPresenceService.addConnection(
+      tenantId,
+      userId,
+      socket.id,
+    );
     socket.emit(SOCKET_EVENTS.CONNECTED, { userId, tenantId });
 
     if (wasOffline) {
@@ -170,19 +248,40 @@ function init(server) {
     // stay tenant-scoped rather than global.
     socket.join(`tenant:${tenantId}`);
 
+    // Snapshot of who is online right now, so a freshly connected client does
+    // not have to wait for the next online/offline transition to know.
+    socket.emit(SOCKET_EVENTS.PRESENCE, {
+      onlineUserIds: CommunicationPresenceService.getOnlineUserIds(tenantId),
+    });
+    // Anything sent to this user while they were offline is now delivered.
+    deliverPending(models, tenantId, userId);
+
     // ── Join a conversation room — ONLY after verifying membership.
     // A malicious client emitting an arbitrary conversationId simply
     // gets an error event back and never joins the room. ─────────
-    socket.on(SOCKET_EVENTS.JOIN_CONVERSATION, async ({ conversationId } = {}, ack) => {
-      try {
-        await CommunicationService.verifyParticipant(models, tenantId, userId, Number(conversationId));
-        socket.join(conversationRoom(conversationId));
-        ack?.({ success: true });
-      } catch (error) {
-        ack?.({ success: false, message: "Not authorized for this conversation" });
-        socket.emit(SOCKET_EVENTS.ERROR, { message: "Not authorized for this conversation" });
-      }
-    });
+    socket.on(
+      SOCKET_EVENTS.JOIN_CONVERSATION,
+      async ({ conversationId } = {}, ack) => {
+        try {
+          await CommunicationService.verifyParticipant(
+            models,
+            tenantId,
+            userId,
+            Number(conversationId),
+          );
+          socket.join(conversationRoom(conversationId));
+          ack?.({ success: true });
+        } catch (error) {
+          ack?.({
+            success: false,
+            message: "Not authorized for this conversation",
+          });
+          socket.emit(SOCKET_EVENTS.ERROR, {
+            message: "Not authorized for this conversation",
+          });
+        }
+      },
+    );
 
     socket.on(SOCKET_EVENTS.LEAVE_CONVERSATION, ({ conversationId } = {}) => {
       if (conversationId) socket.leave(conversationRoom(conversationId));
@@ -192,29 +291,40 @@ function init(server) {
     socket.on(SOCKET_EVENTS.MESSAGE_TYPING, async ({ conversationId } = {}) => {
       if (!conversationId) return;
       try {
-        await CommunicationService.verifyParticipant(models, tenantId, userId, Number(conversationId));
+        await CommunicationService.verifyParticipant(
+          models,
+          tenantId,
+          userId,
+          Number(conversationId),
+        );
       } catch {
         return;
       }
-      socket.to(conversationRoom(conversationId)).emit(SOCKET_EVENTS.MESSAGE_TYPING, {
-        conversationId: Number(conversationId),
-        userId,
-      });
-      CommunicationPresenceService.setTyping(conversationId, userId, () => {
-        socket.to(conversationRoom(conversationId)).emit(SOCKET_EVENTS.MESSAGE_STOP_TYPING, {
+      socket
+        .to(conversationRoom(conversationId))
+        .emit(SOCKET_EVENTS.MESSAGE_TYPING, {
           conversationId: Number(conversationId),
           userId,
         });
+      CommunicationPresenceService.setTyping(conversationId, userId, () => {
+        socket
+          .to(conversationRoom(conversationId))
+          .emit(SOCKET_EVENTS.MESSAGE_STOP_TYPING, {
+            conversationId: Number(conversationId),
+            userId,
+          });
       });
     });
 
     socket.on(SOCKET_EVENTS.MESSAGE_STOP_TYPING, ({ conversationId } = {}) => {
       if (!conversationId) return;
       CommunicationPresenceService.clearTyping(conversationId, userId);
-      socket.to(conversationRoom(conversationId)).emit(SOCKET_EVENTS.MESSAGE_STOP_TYPING, {
-        conversationId: Number(conversationId),
-        userId,
-      });
+      socket
+        .to(conversationRoom(conversationId))
+        .emit(SOCKET_EVENTS.MESSAGE_STOP_TYPING, {
+          conversationId: Number(conversationId),
+          userId,
+        });
     });
 
     // ── Calling — WebRTC signalling ─────────────────────────────────
@@ -223,30 +333,79 @@ function init(server) {
     // callId or conversationId from a malicious client never reaches
     // another user without that check passing first.
 
-    socket.on(SOCKET_EVENTS.CALL_INVITE, async ({ conversationId, callType } = {}, ack) => {
-      try {
-        if (!conversationId || !Object.values(CALL_TYPES).includes(callType)) {
-          ack?.({ success: false, message: "Invalid call request" });
-          return;
-        }
-        if (isUserInCall(userId)) {
-          ack?.({ success: false, reason: "self-busy", message: "You already have an active call" });
-          return;
-        }
+    socket.on(
+      SOCKET_EVENTS.CALL_INVITE,
+      async ({ conversationId, callType } = {}, ack) => {
+        try {
+          if (
+            !conversationId ||
+            !Object.values(CALL_TYPES).includes(callType)
+          ) {
+            ack?.({ success: false, message: "Invalid call request" });
+            return;
+          }
+          if (isUserInCall(userId)) {
+            ack?.({
+              success: false,
+              reason: "self-busy",
+              message: "You already have an active call",
+            });
+            return;
+          }
 
-        const { conversation } = await CommunicationService.verifyParticipant(models, tenantId, userId, Number(conversationId));
-        if (conversation.type !== "DIRECT") {
-          ack?.({ success: false, message: "Calling is currently only available for 1-to-1 conversations" });
-          return;
-        }
-        const calleeId = await CommunicationService.getOtherParticipantId(conversation, userId);
+          const { conversation } = await CommunicationService.verifyParticipant(
+            models,
+            tenantId,
+            userId,
+            Number(conversationId),
+          );
+          if (conversation.type !== "DIRECT") {
+            ack?.({
+              success: false,
+              message:
+                "Calling is currently only available for 1-to-1 conversations",
+            });
+            return;
+          }
+          const calleeId = await CommunicationService.getOtherParticipantId(
+            conversation,
+            userId,
+          );
 
-        if (isUserInCall(calleeId)) {
-          ack?.({ success: false, reason: "busy", message: "This user is currently on another call" });
-          return;
-        }
+          if (isUserInCall(calleeId)) {
+            ack?.({
+              success: false,
+              reason: "busy",
+              message: "This user is currently on another call",
+            });
+            return;
+          }
 
-        if (!CommunicationPresenceService.isOnline(tenantId, calleeId)) {
+          if (!CommunicationPresenceService.isOnline(tenantId, calleeId)) {
+            const record = await CommunicationCallService.createRinging(
+              models,
+              {
+                tenantId,
+                conversationId: Number(conversationId),
+                callerId: userId,
+                calleeId,
+                callType,
+              },
+            );
+            await CommunicationCallService.finalize(
+              models,
+              tenantId,
+              record.id,
+              CALL_STATUS.MISSED,
+            );
+            ack?.({
+              success: false,
+              reason: "offline",
+              message: "This user is currently offline",
+            });
+            return;
+          }
+
           const record = await CommunicationCallService.createRinging(models, {
             tenantId,
             conversationId: Number(conversationId),
@@ -254,69 +413,70 @@ function init(server) {
             calleeId,
             callType,
           });
-          await CommunicationCallService.finalize(models, tenantId, record.id, CALL_STATUS.MISSED);
-          ack?.({ success: false, reason: "offline", message: "This user is currently offline" });
-          return;
-        }
+          const callId = record.id;
 
-        const record = await CommunicationCallService.createRinging(models, {
-          tenantId,
-          conversationId: Number(conversationId),
-          callerId: userId,
-          calleeId,
-          callType,
-        });
-        const callId = record.id;
+          const ringTimer = setTimeout(async () => {
+            const call = activeCallsById.get(callId);
+            if (!call || call.status !== CALL_STATUS.RINGING) return;
+            clearCall(callId);
+            await CommunicationCallService.finalize(
+              models,
+              tenantId,
+              callId,
+              CALL_STATUS.MISSED,
+            );
+            emitToUser(userId, SOCKET_EVENTS.CALL_TIMEOUT, { callId });
+            emitToUser(calleeId, SOCKET_EVENTS.CALL_TIMEOUT, { callId });
+            NotificationCenterService.create(models, {
+              tenantId,
+              userId: calleeId,
+              type: "COMMUNICATION_MISSED_CALL",
+              title: `Missed ${callType.toLowerCase()} call`,
+              message: `You missed a ${callType.toLowerCase()} call from ${socket.user.name || socket.user.email}`,
+            }).catch(() => {});
+          }, CALL_CONFIG.ringTimeoutMs);
 
-        const ringTimer = setTimeout(async () => {
-          const call = activeCallsById.get(callId);
-          if (!call || call.status !== CALL_STATUS.RINGING) return;
-          clearCall(callId);
-          await CommunicationCallService.finalize(models, tenantId, callId, CALL_STATUS.MISSED);
-          emitToUser(userId, SOCKET_EVENTS.CALL_TIMEOUT, { callId });
-          emitToUser(calleeId, SOCKET_EVENTS.CALL_TIMEOUT, { callId });
-          NotificationCenterService.create(models, {
+          registerCall({
+            id: callId,
             tenantId,
-            userId: calleeId,
-            type: "COMMUNICATION_MISSED_CALL",
-            title: `Missed ${callType.toLowerCase()} call`,
-            message: `You missed a ${callType.toLowerCase()} call from ${socket.user.name || socket.user.email}`,
+            conversationId: Number(conversationId),
+            callerId: userId,
+            calleeId,
+            callType,
+            status: CALL_STATUS.RINGING,
+            ringTimer,
+          });
+
+          emitToUser(calleeId, SOCKET_EVENTS.CALL_INVITE, {
+            callId,
+            conversationId: Number(conversationId),
+            callType,
+            caller: {
+              id: userId,
+              name: socket.user.name,
+              email: socket.user.email,
+            },
+          });
+
+          ack?.({ success: true, callId });
+
+          AuditService.log({
+            models,
+            tenantId,
+            userId,
+            action: AUDIT_ACTIONS.COMMUNICATION_CALL_INITIATED,
+            module: AUDIT_MODULES.COMMUNICATION,
+            remarks: `Initiated ${callType} call ${callId} in conversation ${conversationId}`,
+            status: AUDIT_STATUS.SUCCESS,
           }).catch(() => {});
-        }, CALL_CONFIG.ringTimeoutMs);
-
-        registerCall({
-          id: callId,
-          tenantId,
-          conversationId: Number(conversationId),
-          callerId: userId,
-          calleeId,
-          callType,
-          status: CALL_STATUS.RINGING,
-          ringTimer,
-        });
-
-        emitToUser(calleeId, SOCKET_EVENTS.CALL_INVITE, {
-          callId,
-          conversationId: Number(conversationId),
-          callType,
-          caller: { id: userId, name: socket.user.name, email: socket.user.email },
-        });
-
-        ack?.({ success: true, callId });
-
-        AuditService.log({
-          models,
-          tenantId,
-          userId,
-          action: AUDIT_ACTIONS.COMMUNICATION_CALL_INITIATED,
-          module: AUDIT_MODULES.COMMUNICATION,
-          remarks: `Initiated ${callType} call ${callId} in conversation ${conversationId}`,
-          status: AUDIT_STATUS.SUCCESS,
-        }).catch(() => {});
-      } catch (error) {
-        ack?.({ success: false, message: error.message || "Could not start the call" });
-      }
-    });
+        } catch (error) {
+          ack?.({
+            success: false,
+            message: error.message || "Could not start the call",
+          });
+        }
+      },
+    );
 
     socket.on(SOCKET_EVENTS.CALL_ACCEPT, async ({ callId } = {}, ack) => {
       const call = activeCallsById.get(callId);
@@ -333,17 +493,29 @@ function init(server) {
 
     socket.on(SOCKET_EVENTS.CALL_DECLINE, async ({ callId } = {}) => {
       const call = activeCallsById.get(callId);
-      if (!call || call.tenantId !== tenantId || call.calleeId !== userId) return;
+      if (!call || call.tenantId !== tenantId || call.calleeId !== userId)
+        return;
       clearCall(callId);
-      await CommunicationCallService.finalize(models, tenantId, callId, CALL_STATUS.DECLINED);
+      await CommunicationCallService.finalize(
+        models,
+        tenantId,
+        callId,
+        CALL_STATUS.DECLINED,
+      );
       emitToUser(call.callerId, SOCKET_EVENTS.CALL_DECLINE, { callId });
     });
 
     socket.on(SOCKET_EVENTS.CALL_CANCEL, async ({ callId } = {}) => {
       const call = activeCallsById.get(callId);
-      if (!call || call.tenantId !== tenantId || call.callerId !== userId) return;
+      if (!call || call.tenantId !== tenantId || call.callerId !== userId)
+        return;
       clearCall(callId);
-      await CommunicationCallService.finalize(models, tenantId, callId, CALL_STATUS.CANCELLED);
+      await CommunicationCallService.finalize(
+        models,
+        tenantId,
+        callId,
+        CALL_STATUS.CANCELLED,
+      );
       emitToUser(call.calleeId, SOCKET_EVENTS.CALL_CANCEL, { callId });
     });
 
@@ -370,13 +542,20 @@ function init(server) {
       }
     });
 
-    socket.on(SOCKET_EVENTS.CALL_ICE_CANDIDATE, ({ callId, candidate } = {}) => {
-      const call = activeCallsById.get(callId);
-      if (!call || call.tenantId !== tenantId) return;
-      if (call.callerId !== userId && call.calleeId !== userId) return;
-      const otherId = call.callerId === userId ? call.calleeId : call.callerId;
-      emitToUser(otherId, SOCKET_EVENTS.CALL_ICE_CANDIDATE, { callId, candidate });
-    });
+    socket.on(
+      SOCKET_EVENTS.CALL_ICE_CANDIDATE,
+      ({ callId, candidate } = {}) => {
+        const call = activeCallsById.get(callId);
+        if (!call || call.tenantId !== tenantId) return;
+        if (call.callerId !== userId && call.calleeId !== userId) return;
+        const otherId =
+          call.callerId === userId ? call.calleeId : call.callerId;
+        emitToUser(otherId, SOCKET_EVENTS.CALL_ICE_CANDIDATE, {
+          callId,
+          candidate,
+        });
+      },
+    );
 
     socket.on(SOCKET_EVENTS.CALL_END, async ({ callId } = {}) => {
       const call = activeCallsById.get(callId);
@@ -399,9 +578,16 @@ function init(server) {
     });
 
     socket.on("disconnect", () => {
-      const nowOffline = CommunicationPresenceService.removeConnection(tenantId, userId, socket.id);
+      const nowOffline = CommunicationPresenceService.removeConnection(
+        tenantId,
+        userId,
+        socket.id,
+      );
       if (nowOffline) {
-        io.to(`tenant:${tenantId}`).emit(SOCKET_EVENTS.USER_OFFLINE, { userId, lastSeenAt: new Date() });
+        io.to(`tenant:${tenantId}`).emit(SOCKET_EVENTS.USER_OFFLINE, {
+          userId,
+          lastSeenAt: new Date(),
+        });
       }
 
       // ── Call cleanup — a user closing their tab/losing connection
@@ -411,9 +597,18 @@ function init(server) {
       if (callId) {
         const call = clearCall(callId);
         if (call) {
-          const otherId = call.callerId === userId ? call.calleeId : call.callerId;
-          emitToUser(otherId, SOCKET_EVENTS.CALL_END, { callId, reason: "peer-disconnected" });
-          CommunicationCallService.finalize(models, call.tenantId, callId, terminalStatusFor(call)).catch(() => {});
+          const otherId =
+            call.callerId === userId ? call.calleeId : call.callerId;
+          emitToUser(otherId, SOCKET_EVENTS.CALL_END, {
+            callId,
+            reason: "peer-disconnected",
+          });
+          CommunicationCallService.finalize(
+            models,
+            call.tenantId,
+            callId,
+            terminalStatusFor(call),
+          ).catch(() => {});
         }
       }
     });
@@ -425,7 +620,9 @@ function init(server) {
 
 function getIO() {
   if (!ioInstance) {
-    throw new Error("Communication Socket.IO service not initialized — call init(server) first");
+    throw new Error(
+      "Communication Socket.IO service not initialized — call init(server) first",
+    );
   }
   return ioInstance;
 }

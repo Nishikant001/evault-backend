@@ -15,15 +15,24 @@ const CommunicationAttachmentStorageService = require("../services/communication
 const CommunicationSocket = require("../services/communicationSocketService");
 const NotificationCenterService = require("../services/notificationCenterService");
 const AuditService = require("../services/auditService");
-const { AUDIT_ACTIONS, AUDIT_MODULES, AUDIT_STATUS } = require("../constants/auditActions");
-const { SOCKET_EVENTS, MESSAGE_TYPES } = require("../constants/communicationConstants");
+const {
+  AUDIT_ACTIONS,
+  AUDIT_MODULES,
+  AUDIT_STATUS,
+} = require("../constants/auditActions");
+const {
+  SOCKET_EVENTS,
+  MESSAGE_TYPES,
+} = require("../constants/communicationConstants");
 
 function handleError(res, error) {
   const statusCode = error.statusCode || 500;
   if (statusCode >= 500) {
     console.log("Communication error:", error.message);
   }
-  return res.status(statusCode).json({ success: false, message: error.message || "Something went wrong" });
+  return res
+    .status(statusCode)
+    .json({ success: false, message: error.message || "Something went wrong" });
 }
 
 /** Notifies the recipient of a new message: real-time via Socket.IO
@@ -32,10 +41,41 @@ function handleError(res, error) {
  * always correct here since sender and recipient are always the same
  * tenant (enforced by CommunicationService.verifyParticipant before this
  * is ever called). */
-async function notifyRecipient({ models, tenantId, recipientId, senderName, conversationId, message }) {
-  CommunicationSocket.emitToUser(recipientId, SOCKET_EVENTS.MESSAGE_NEW, { conversationId, message });
+async function notifyRecipient({
+  models,
+  tenantId,
+  recipientId,
+  senderName,
+  conversationId,
+  message,
+}) {
+  CommunicationSocket.emitToUser(recipientId, SOCKET_EVENTS.MESSAGE_NEW, {
+    conversationId,
+    message,
+  });
 
-  if (!CommunicationSocket.isUserOnline(tenantId, recipientId)) {
+  if (CommunicationSocket.isUserOnline(tenantId, recipientId)) {
+    // Recipient has a live connection: the message counts as delivered. The
+    // sender is told so single ticks can become double ticks.
+    try {
+      const delivered = await CommunicationService.markMessageDelivered(
+        models,
+        tenantId,
+        message.id,
+      );
+      CommunicationSocket.emitToUser(
+        message.senderId,
+        SOCKET_EVENTS.MESSAGE_DELIVERED,
+        {
+          conversationId: Number(conversationId),
+          upToMessageId: message.id,
+          deliveredAt: delivered?.deliveredAt || new Date(),
+        },
+      );
+    } catch (error) {
+      console.log("Communication delivery receipt error:", error.message);
+    }
+  } else {
     try {
       await NotificationCenterService.create(models, {
         tenantId,
@@ -46,10 +86,10 @@ async function notifyRecipient({ models, tenantId, recipientId, senderName, conv
           message.messageType === MESSAGE_TYPES.VOICE
             ? "Sent you a voice message"
             : message.messageType === MESSAGE_TYPES.FILE
-            ? message.attachments?.length === 1
-              ? `Sent a file: ${message.attachments[0].originalName}`
-              : `Sent ${message.attachments?.length || "a"} file(s)`
-            : (message.content || "").slice(0, 140),
+              ? message.attachments?.length === 1
+                ? `Sent a file: ${message.attachments[0].originalName}`
+                : `Sent ${message.attachments?.length || "a"} file(s)`
+              : (message.content || "").slice(0, 140),
       });
     } catch (error) {
       // Notification failures must never break message delivery.
@@ -61,9 +101,23 @@ async function notifyRecipient({ models, tenantId, recipientId, senderName, conv
 /** Fan-out for GROUP conversations (N recipients) as well as DIRECT
  * (1 recipient) — every message-send handler should use this instead of
  * assuming a single other participant. */
-async function notifyRecipients({ models, tenantId, recipientIds, senderName, conversationId, message }) {
+async function notifyRecipients({
+  models,
+  tenantId,
+  recipientIds,
+  senderName,
+  conversationId,
+  message,
+}) {
   for (const recipientId of recipientIds) {
-    await notifyRecipient({ models, tenantId, recipientId, senderName, conversationId, message });
+    await notifyRecipient({
+      models,
+      tenantId,
+      recipientId,
+      senderName,
+      conversationId,
+      message,
+    });
   }
 }
 
@@ -72,7 +126,13 @@ class CommunicationController {
   static async searchUsers(req, res) {
     try {
       const { q = "" } = req.query;
-      const users = await CommunicationService.searchUsers(req.models, req.masterModels, req.user.tenantId, req.user.id, q);
+      const users = await CommunicationService.searchUsers(
+        req.models,
+        req.masterModels,
+        req.user.tenantId,
+        req.user.id,
+        q,
+      );
       return res.json({ success: true, data: users });
     } catch (error) {
       return handleError(res, error);
@@ -88,7 +148,7 @@ class CommunicationController {
         req.masterModels,
         req.user.tenantId,
         req.user.id,
-        { search }
+        { search },
       );
       return res.json({ success: true, data: conversations });
     } catch (error) {
@@ -99,12 +159,13 @@ class CommunicationController {
   static async createConversation(req, res) {
     try {
       const { userId: targetUserId } = req.body;
-      const { conversation, created } = await CommunicationService.findOrCreateConversation(
-        req.models,
-        req.user.tenantId,
-        req.user.id,
-        targetUserId
-      );
+      const { conversation, created } =
+        await CommunicationService.findOrCreateConversation(
+          req.models,
+          req.user.tenantId,
+          req.user.id,
+          targetUserId,
+        );
 
       if (created) {
         await AuditService.log({
@@ -115,13 +176,25 @@ class CommunicationController {
           status: AUDIT_STATUS.SUCCESS,
         });
 
-        const otherId = await CommunicationService.getOtherParticipantId(conversation, req.user.id);
-        CommunicationSocket.emitToUser(otherId, SOCKET_EVENTS.CONVERSATION_CREATED, {
-          conversationId: conversation.id,
-        });
+        const otherId = await CommunicationService.getOtherParticipantId(
+          conversation,
+          req.user.id,
+        );
+        CommunicationSocket.emitToUser(
+          otherId,
+          SOCKET_EVENTS.CONVERSATION_CREATED,
+          {
+            conversationId: conversation.id,
+          },
+        );
       }
 
-      return res.status(created ? 201 : 200).json({ success: true, data: { conversationId: conversation.id, created } });
+      return res
+        .status(created ? 201 : 200)
+        .json({
+          success: true,
+          data: { conversationId: conversation.id, created },
+        });
     } catch (error) {
       return handleError(res, error);
     }
@@ -133,11 +206,15 @@ class CommunicationController {
         req.models,
         req.user.tenantId,
         req.user.id,
-        req.params.id
+        req.params.id,
       );
 
       if (conversation.type === "GROUP") {
-        const members = await CommunicationService.getActiveParticipants(req.models, req.user.tenantId, conversation.id);
+        const members = await CommunicationService.getActiveParticipants(
+          req.models,
+          req.user.tenantId,
+          conversation.id,
+        );
         return res.json({
           success: true,
           data: {
@@ -156,7 +233,19 @@ class CommunicationController {
         });
       }
 
-      const otherId = await CommunicationService.getOtherParticipantId(conversation, req.user.id);
+      const otherId = await CommunicationService.getOtherParticipantId(
+        conversation,
+        req.user.id,
+      );
+      const otherParticipant =
+        await req.models.CommunicationParticipant.findOne({
+          where: {
+            conversationId: conversation.id,
+            tenantId: req.user.tenantId,
+            userId: otherId,
+          },
+          attributes: ["lastReadMessageId"],
+        });
       return res.json({
         success: true,
         data: {
@@ -164,7 +253,12 @@ class CommunicationController {
           type: "DIRECT",
           otherUserId: otherId,
           lastMessageAt: conversation.lastMessageAt,
-          isOtherUserOnline: CommunicationSocket.isUserOnline(req.user.tenantId, otherId),
+          isOtherUserOnline: CommunicationSocket.isUserOnline(
+            req.user.tenantId,
+            otherId,
+          ),
+          // Lets the client draw "read" ticks on first open, not only after a live event.
+          otherLastReadMessageId: otherParticipant?.lastReadMessageId || 0,
         },
       });
     } catch (error) {
@@ -176,10 +270,15 @@ class CommunicationController {
   static async createGroup(req, res) {
     try {
       const { name, participantIds = [] } = req.body;
-      const conversation = await CommunicationService.createGroupConversation(req.models, req.user.tenantId, req.user.id, {
-        name,
-        participantIds,
-      });
+      const conversation = await CommunicationService.createGroupConversation(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        {
+          name,
+          participantIds,
+        },
+      );
 
       await AuditService.log({
         req,
@@ -193,13 +292,19 @@ class CommunicationController {
         req.models,
         req.user.tenantId,
         conversation,
-        req.user.id
+        req.user.id,
       );
       for (const memberId of memberIds) {
-        CommunicationSocket.emitToUser(memberId, SOCKET_EVENTS.CONVERSATION_CREATED, { conversationId: conversation.id });
+        CommunicationSocket.emitToUser(
+          memberId,
+          SOCKET_EVENTS.CONVERSATION_CREATED,
+          { conversationId: conversation.id },
+        );
       }
 
-      return res.status(201).json({ success: true, data: { conversationId: conversation.id } });
+      return res
+        .status(201)
+        .json({ success: true, data: { conversationId: conversation.id } });
     } catch (error) {
       return handleError(res, error);
     }
@@ -213,7 +318,7 @@ class CommunicationController {
         req.user.tenantId,
         req.user.id,
         req.params.id,
-        userIds
+        userIds,
       );
 
       await AuditService.log({
@@ -224,14 +329,23 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      CommunicationSocket.emitToConversation(req.params.id, SOCKET_EVENTS.CONVERSATION_UPDATED, {
-        conversationId: Number(req.params.id),
-      });
+      CommunicationSocket.emitToConversation(
+        req.params.id,
+        SOCKET_EVENTS.CONVERSATION_UPDATED,
+        {
+          conversationId: Number(req.params.id),
+        },
+      );
       for (const id of userIds) {
-        CommunicationSocket.emitToUser(id, SOCKET_EVENTS.CONVERSATION_CREATED, { conversationId: Number(req.params.id) });
+        CommunicationSocket.emitToUser(id, SOCKET_EVENTS.CONVERSATION_CREATED, {
+          conversationId: Number(req.params.id),
+        });
       }
 
-      return res.json({ success: true, data: members.map((m) => ({ id: m.id, name: m.name, email: m.email })) });
+      return res.json({
+        success: true,
+        data: members.map((m) => ({ id: m.id, name: m.name, email: m.email })),
+      });
     } catch (error) {
       return handleError(res, error);
     }
@@ -239,8 +353,15 @@ class CommunicationController {
 
   static async removeParticipant(req, res) {
     try {
-      const targetUserId = req.params.userId === "me" ? req.user.id : Number(req.params.userId);
-      await CommunicationService.removeParticipant(req.models, req.user.tenantId, req.user.id, req.params.id, targetUserId);
+      const targetUserId =
+        req.params.userId === "me" ? req.user.id : Number(req.params.userId);
+      await CommunicationService.removeParticipant(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+        targetUserId,
+      );
 
       await AuditService.log({
         req,
@@ -253,13 +374,21 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      CommunicationSocket.emitToConversation(req.params.id, SOCKET_EVENTS.CONVERSATION_UPDATED, {
-        conversationId: Number(req.params.id),
-      });
-      CommunicationSocket.emitToUser(targetUserId, SOCKET_EVENTS.CONVERSATION_UPDATED, {
-        conversationId: Number(req.params.id),
-        removed: true,
-      });
+      CommunicationSocket.emitToConversation(
+        req.params.id,
+        SOCKET_EVENTS.CONVERSATION_UPDATED,
+        {
+          conversationId: Number(req.params.id),
+        },
+      );
+      CommunicationSocket.emitToUser(
+        targetUserId,
+        SOCKET_EVENTS.CONVERSATION_UPDATED,
+        {
+          conversationId: Number(req.params.id),
+          removed: true,
+        },
+      );
 
       return res.json({ success: true });
     } catch (error) {
@@ -270,7 +399,13 @@ class CommunicationController {
   static async renameGroup(req, res) {
     try {
       const { name } = req.body;
-      const conversation = await CommunicationService.renameGroup(req.models, req.user.tenantId, req.user.id, req.params.id, name);
+      const conversation = await CommunicationService.renameGroup(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+        name,
+      );
 
       await AuditService.log({
         req,
@@ -280,10 +415,14 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      CommunicationSocket.emitToConversation(req.params.id, SOCKET_EVENTS.CONVERSATION_UPDATED, {
-        conversationId: Number(req.params.id),
-        name: conversation.name,
-      });
+      CommunicationSocket.emitToConversation(
+        req.params.id,
+        SOCKET_EVENTS.CONVERSATION_UPDATED,
+        {
+          conversationId: Number(req.params.id),
+          name: conversation.name,
+        },
+      );
 
       return res.json({ success: true, data: { name: conversation.name } });
     } catch (error) {
@@ -295,10 +434,16 @@ class CommunicationController {
   static async listMessages(req, res) {
     try {
       const { beforeId, limit } = req.query;
-      const messages = await CommunicationService.listMessages(req.models, req.user.tenantId, req.user.id, req.params.id, {
-        beforeId,
-        limit,
-      });
+      const messages = await CommunicationService.listMessages(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+        {
+          beforeId,
+          limit,
+        },
+      );
       return res.json({ success: true, data: messages });
     } catch (error) {
       return handleError(res, error);
@@ -313,7 +458,7 @@ class CommunicationController {
         req.user.tenantId,
         req.user.id,
         req.params.id,
-        { content, replyToMessageId }
+        { content, replyToMessageId },
       );
 
       await AuditService.log({
@@ -324,15 +469,24 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      const membership = await CommunicationService.verifyParticipant(req.models, req.user.tenantId, req.user.id, req.params.id);
+      const membership = await CommunicationService.verifyParticipant(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+      );
       const recipientIds = await CommunicationService.getOtherParticipantIds(
         req.models,
         req.user.tenantId,
         membership.conversation,
-        req.user.id
+        req.user.id,
       );
 
-      CommunicationSocket.emitToConversation(req.params.id, SOCKET_EVENTS.MESSAGE_SENT, { message });
+      CommunicationSocket.emitToConversation(
+        req.params.id,
+        SOCKET_EVENTS.MESSAGE_SENT,
+        { message },
+      );
       await notifyRecipients({
         models: req.models,
         tenantId: req.user.tenantId,
@@ -351,7 +505,13 @@ class CommunicationController {
   static async editMessage(req, res) {
     try {
       const { content } = req.body;
-      const message = await CommunicationService.editMessage(req.models, req.user.tenantId, req.user.id, req.params.id, content);
+      const message = await CommunicationService.editMessage(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+        content,
+      );
 
       await AuditService.log({
         req,
@@ -361,7 +521,11 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      CommunicationSocket.emitToConversation(message.conversationId, SOCKET_EVENTS.MESSAGE_EDITED, { message });
+      CommunicationSocket.emitToConversation(
+        message.conversationId,
+        SOCKET_EVENTS.MESSAGE_EDITED,
+        { message },
+      );
 
       return res.json({ success: true, data: message });
     } catch (error) {
@@ -371,7 +535,12 @@ class CommunicationController {
 
   static async deleteMessage(req, res) {
     try {
-      const message = await CommunicationService.deleteMessage(req.models, req.user.tenantId, req.user.id, req.params.id);
+      const message = await CommunicationService.deleteMessage(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+      );
 
       await AuditService.log({
         req,
@@ -381,7 +550,11 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      CommunicationSocket.emitToConversation(message.conversationId, SOCKET_EVENTS.MESSAGE_DELETED, { message });
+      CommunicationSocket.emitToConversation(
+        message.conversationId,
+        SOCKET_EVENTS.MESSAGE_DELETED,
+        { message },
+      );
 
       return res.json({ success: true, data: message });
     } catch (error) {
@@ -391,7 +564,12 @@ class CommunicationController {
 
   static async markRead(req, res) {
     try {
-      const result = await CommunicationService.markConversationRead(req.models, req.user.tenantId, req.user.id, req.params.id);
+      const result = await CommunicationService.markConversationRead(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+      );
 
       // Note: read receipts are business-meaningful but high-frequency;
       // audited at INFO-equivalent granularity only when explicitly
@@ -401,11 +579,15 @@ class CommunicationController {
       //   action: AUDIT_ACTIONS.COMMUNICATION_MESSAGE_READ,
       //   remarks: `Marked conversation ${req.params.id} read`, status: AUDIT_STATUS.SUCCESS });
 
-      CommunicationSocket.emitToConversation(req.params.id, SOCKET_EVENTS.MESSAGE_READ, {
-        conversationId: Number(req.params.id),
-        userId: req.user.id,
-        lastReadMessageId: result.lastReadMessageId,
-      });
+      CommunicationSocket.emitToConversation(
+        req.params.id,
+        SOCKET_EVENTS.MESSAGE_READ,
+        {
+          conversationId: Number(req.params.id),
+          userId: req.user.id,
+          lastReadMessageId: result.lastReadMessageId,
+        },
+      );
 
       return res.json({ success: true, data: result });
     } catch (error) {
@@ -417,7 +599,9 @@ class CommunicationController {
   static async sendVoiceMessage(req, res) {
     try {
       if (!req.file) {
-        return res.status(400).json({ success: false, message: "Voice recording is required" });
+        return res
+          .status(400)
+          .json({ success: false, message: "Voice recording is required" });
       }
 
       const durationSeconds = Number(req.body.durationSeconds);
@@ -434,13 +618,19 @@ class CommunicationController {
         mimeType: req.file.mimetype,
       });
 
-      const message = await CommunicationService.sendVoiceMessage(req.models, req.user.tenantId, req.user.id, req.params.id, {
-        storageKey,
-        mimeType: req.file.mimetype,
-        fileSize: req.file.size,
-        durationSeconds,
-        replyToMessageId: req.body.replyToMessageId,
-      });
+      const message = await CommunicationService.sendVoiceMessage(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+        {
+          storageKey,
+          mimeType: req.file.mimetype,
+          fileSize: req.file.size,
+          durationSeconds,
+          replyToMessageId: req.body.replyToMessageId,
+        },
+      );
 
       await AuditService.log({
         req,
@@ -450,15 +640,24 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      const membership = await CommunicationService.verifyParticipant(req.models, req.user.tenantId, req.user.id, req.params.id);
+      const membership = await CommunicationService.verifyParticipant(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+      );
       const recipientIds = await CommunicationService.getOtherParticipantIds(
         req.models,
         req.user.tenantId,
         membership.conversation,
-        req.user.id
+        req.user.id,
       );
 
-      CommunicationSocket.emitToConversation(req.params.id, SOCKET_EVENTS.MESSAGE_SENT, { message });
+      CommunicationSocket.emitToConversation(
+        req.params.id,
+        SOCKET_EVENTS.MESSAGE_SENT,
+        { message },
+      );
       await notifyRecipients({
         models: req.models,
         tenantId: req.user.tenantId,
@@ -482,18 +681,31 @@ class CommunicationController {
       const voice = await CommunicationVoiceMessage.findOne({
         where: { id: req.params.id, tenantId: req.user.tenantId },
       });
-      if (!voice) return res.status(404).json({ success: false, message: "Voice message not found" });
+      if (!voice)
+        return res
+          .status(404)
+          .json({ success: false, message: "Voice message not found" });
 
       const message = await CommunicationMessage.findOne({
         where: { id: voice.messageId, tenantId: req.user.tenantId },
       });
-      if (!message) return res.status(404).json({ success: false, message: "Voice message not found" });
+      if (!message)
+        return res
+          .status(404)
+          .json({ success: false, message: "Voice message not found" });
 
       // Access control: must be a verified participant of the parent
       // conversation — this is what stops IDOR on /voice/:id.
-      await CommunicationService.verifyParticipant(req.models, req.user.tenantId, req.user.id, message.conversationId);
+      await CommunicationService.verifyParticipant(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        message.conversationId,
+      );
 
-      const buffer = await CommunicationVoiceStorageService.read(voice.storageKey);
+      const buffer = await CommunicationVoiceStorageService.read(
+        voice.storageKey,
+      );
 
       await AuditService.log({
         req,
@@ -522,7 +734,9 @@ class CommunicationController {
     try {
       const files = req.files || [];
       if (!files.length) {
-        return res.status(400).json({ success: false, message: "At least one file is required" });
+        return res
+          .status(400)
+          .json({ success: false, message: "At least one file is required" });
       }
 
       // Validate every file up front before saving any of them.
@@ -548,7 +762,9 @@ class CommunicationController {
           originalName: file.originalname,
           mimeType: file.mimetype,
           fileSize: file.size,
-          fileCategory: CommunicationAttachmentStorageService.categoryForMime(file.mimetype),
+          fileCategory: CommunicationAttachmentStorageService.categoryForMime(
+            file.mimetype,
+          ),
         });
       }
 
@@ -557,7 +773,11 @@ class CommunicationController {
         req.user.tenantId,
         req.user.id,
         req.params.id,
-        { content: req.body.content, replyToMessageId: req.body.replyToMessageId, attachments }
+        {
+          content: req.body.content,
+          replyToMessageId: req.body.replyToMessageId,
+          attachments,
+        },
       );
 
       await AuditService.log({
@@ -568,15 +788,24 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      const membership = await CommunicationService.verifyParticipant(req.models, req.user.tenantId, req.user.id, req.params.id);
+      const membership = await CommunicationService.verifyParticipant(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        req.params.id,
+      );
       const recipientIds = await CommunicationService.getOtherParticipantIds(
         req.models,
         req.user.tenantId,
         membership.conversation,
-        req.user.id
+        req.user.id,
       );
 
-      CommunicationSocket.emitToConversation(req.params.id, SOCKET_EVENTS.MESSAGE_SENT, { message });
+      CommunicationSocket.emitToConversation(
+        req.params.id,
+        SOCKET_EVENTS.MESSAGE_SENT,
+        { message },
+      );
       await notifyRecipients({
         models: req.models,
         tenantId: req.user.tenantId,
@@ -604,22 +833,40 @@ class CommunicationController {
       const attachment = await CommunicationAttachment.findOne({
         where: { id: req.params.id, tenantId: req.user.tenantId },
       });
-      if (!attachment) return res.status(404).json({ success: false, message: "Attachment not found" });
+      if (!attachment)
+        return res
+          .status(404)
+          .json({ success: false, message: "Attachment not found" });
 
       const message = await CommunicationMessage.findOne({
         where: { id: attachment.messageId, tenantId: req.user.tenantId },
       });
-      if (!message) return res.status(404).json({ success: false, message: "Attachment not found" });
+      if (!message)
+        return res
+          .status(404)
+          .json({ success: false, message: "Attachment not found" });
 
       // Access control: must be a verified participant of the parent
       // conversation — this is what stops IDOR on /attachments/:id.
-      await CommunicationService.verifyParticipant(req.models, req.user.tenantId, req.user.id, message.conversationId);
+      await CommunicationService.verifyParticipant(
+        req.models,
+        req.user.tenantId,
+        req.user.id,
+        message.conversationId,
+      );
 
       if (attachment.scanStatus === "INFECTED") {
-        return res.status(403).json({ success: false, message: "This file was flagged and cannot be downloaded" });
+        return res
+          .status(403)
+          .json({
+            success: false,
+            message: "This file was flagged and cannot be downloaded",
+          });
       }
 
-      const buffer = await CommunicationAttachmentStorageService.read(attachment.storageKey);
+      const buffer = await CommunicationAttachmentStorageService.read(
+        attachment.storageKey,
+      );
 
       await AuditService.log({
         req,
@@ -629,12 +876,13 @@ class CommunicationController {
         status: AUDIT_STATUS.SUCCESS,
       });
 
-      const inline = req.query.mode === "inline" && attachment.fileCategory === "IMAGE";
+      const inline =
+        req.query.mode === "inline" && attachment.fileCategory === "IMAGE";
       res.setHeader("Content-Type", attachment.mimeType);
       res.setHeader("Content-Length", buffer.length);
       res.setHeader(
         "Content-Disposition",
-        `${inline ? "inline" : "attachment"}; filename="${encodeURIComponent(attachment.originalName)}"`
+        `${inline ? "inline" : "attachment"}; filename="${encodeURIComponent(attachment.originalName)}"`,
       );
       res.setHeader("Cache-Control", "private, max-age=3600");
       return res.send(buffer);

@@ -28,6 +28,9 @@ const DEV_ORIGINS = [
   "http://localhost:5173",
   "http://localhost:3000",
   "http://127.0.0.1:5173",
+  "https://evault.excelligent.co.in",
+  "https://evault-api.excelligent.co.in",
+  "http://localhost:8081",
 ];
 
 // PRODUCTION DEPLOYMENT — additional exact origins (the marketing site,
