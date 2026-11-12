@@ -24,6 +24,7 @@
 // onward), not here — this file only defines what CAN be associated.
 function defineTenantModels(sequelize) {
   const User = require("./User")(sequelize);
+const BiometricDevice = require("./BiometricDevice")(sequelize);
   const RefreshToken = require("./RefreshToken")(sequelize);
   const AuditLog = require("./AuditLog")(sequelize);
   const CompanyCode = require("./CompanyCode")(sequelize);
@@ -373,6 +374,7 @@ CrossDepartmentDocumentShare,
     CommunicationMessage,
     CommunicationVoiceMessage,
     CommunicationAttachment,
+ BiometricDevice,
     CommunicationCallSession,
   };
 }

@@ -837,6 +837,39 @@ static async getAll(req, res) {
       return res.status(500).json({ success: false, message: error.message });
     }
   }
+
+
+
+ static async getMyStorage(req, res) {
+    try {
+      const tenantId = req.user.tenantId;
+
+      if (!tenantId) {
+        return res.status(403).json({
+          success: false,
+          message: "Tenant access required",
+        });
+      }
+
+      const { measureTenantStorage } = require("../services/tenantStorageService");
+
+      const storage = await measureTenantStorage(tenantId);
+
+      return res.status(200).json({
+        success: true,
+        data: storage,
+      });
+    } catch (error) {
+      console.error("[TenantStorage] getMyStorage error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to fetch tenant storage",
+      });
+    }
+  }
 }
+
+
 
 module.exports = TenantController;

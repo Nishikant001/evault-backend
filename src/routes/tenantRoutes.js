@@ -67,6 +67,12 @@ router.put(
 );
 
 router.get(
+  "/my-storage",
+  authMiddleware,
+  roleMiddleware("TenantAdmin"),
+  TenantController.getMyStorage
+);
+router.get(
   "/:id",
   authMiddleware,
   roleMiddleware("SuperAdmin"),
